@@ -1,18 +1,11 @@
 local utils = require("mp.utils")
 local options = require("mp.options")
 
+-- Defaults — overridden by script-opts/mpv-subtitleminer.conf
 local opts = {
-  -- Either adjust settings here OR in script-opts/mpv-subtitleminer.conf
-  -- ========== SETTINGS ==========
-  -- List of ports to try starting the server on.
-  ports = { 61777 }, -- 61778, 61779, 61780, 61781 },
-  -- When true (default), starts the mpv-subtitleminer server automatically on mpv startup.
+  ports = { 61777 },
   auto_start = true,
-  -- Tolerance (in seconds) for the overlap check when matching primary and
-  -- secondary subtitle lines. Two lines match if their time ranges overlap
-  -- within this many seconds. Default: 0.5 (500ms).
   secondary_match_threshold = 0.5,
-  -- ==============================
 }
 
 options.read_options(opts, "mpv-subtitleminer")
