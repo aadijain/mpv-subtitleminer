@@ -6,6 +6,7 @@ local opts = {
   -- Either adjust settings here OR in script-opts/mpv-subtitleminer.conf
   ports = { 61777, 61778, 61779, 61780, 61781 },
   auto_start = true,
+  secondary_match_threshold = 0.5,
 }
 
 options.read_options(opts, "mpv-subtitleminer")
@@ -181,6 +182,10 @@ local function try_start_on_port(port_index)
     table.insert(args, tostring(mpv_pid))
   else
     mp.msg.warn("Could not determine mpv PID; instance validation disabled")
+  end
+  if opts.secondary_match_threshold then
+    table.insert(args, "--secondary-match-threshold")
+    table.insert(args, tostring(opts.secondary_match_threshold))
   end
 
   server_process = mp.command_native_async({

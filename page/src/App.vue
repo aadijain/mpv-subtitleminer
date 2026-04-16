@@ -14,7 +14,7 @@
 
   const STORAGE_KEY = 'mpv_subtitle_tool_settings'
   const defaultSettings: Settings = {
-    anki: { noteType: '', frontField: '', sentenceField: '', audioField: '', imageField: '', maxCardAgeMinutes: 5 },
+    anki: { noteType: '', frontField: '', sentenceField: '', audioField: '', imageField: '', secondarySubField: '', maxCardAgeMinutes: 5 },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: { subtitleFontSize: 110 },
     media: {
@@ -151,6 +151,7 @@
       sentenceField: '',
       audioField: '',
       imageField: '',
+      secondarySubField: '',
       maxCardAgeMinutes: 5,
     }
   }
@@ -207,6 +208,8 @@
   interface SubtitleMessage {
     id: number
     subtitle: string
+    secondary_subtitle?: string
+    showSecondary: boolean
     time_pos: number
     sub_start: number
     sub_end: number
@@ -300,6 +303,30 @@
         return
       }
 
+      if (type === 'secondary_update') {
+        const id = asNumber(d.id)
+        const text = asString(d.secondary_subtitle)
+        if (id !== null && text) {
+          const msg = messages.value.find((m) => m.id === id && m.sourcePort === port)
+          if (msg) msg.secondary_subtitle = text
+        }
+        return
+      }
+
+      if (type === 'secondary_append') {
+        const id = asNumber(d.id)
+        const text = asString(d.secondary_subtitle)
+        if (id !== null && text) {
+          const msg = messages.value.find((m) => m.id === id && m.sourcePort === port)
+          if (msg) {
+            msg.secondary_subtitle = msg.secondary_subtitle
+              ? msg.secondary_subtitle + '\n' + text
+              : text
+          }
+        }
+        return
+      }
+
       if (type === 'thumbnail' || type === 'audio') {
         const media = parseMediaMessage(d)
         if (!media) return
@@ -383,8 +410,9 @@
     }
     const normalizedTimePos = time_pos ?? sub_start
     const uid = `${port}-${id}`
+    const secondary_subtitle = asString(d.secondary_subtitle) ?? undefined
     const media_path = asString(d.media_path) ?? undefined
-    return { id, subtitle, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid, media_path }
+    return { id, subtitle, secondary_subtitle, showSecondary: false, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid, media_path }
   }
 
   function parseMediaMessage(d: JsonObject): { id: number; data: string } | null {
@@ -662,7 +690,7 @@
     const selectedMsgs = getSelectedMessages()
     if (!ankiConfigured.value || selectedMsgs.length === 0) return
 
-    const { sentenceField, audioField, imageField } = settings.value.anki
+    const { sentenceField, audioField, imageField, secondarySubField } = settings.value.anki
     const { first, last } = getSelectionRange() ?? {}
     if (!first || !last) return
 
@@ -732,6 +760,17 @@
           const filename = generateMediaFilename(primaryId, 'image')
           await anki.storeMediaFile(filename, imageData)
           fieldUpdates[imageField] = `<img src="${filename}">`
+        }
+      }
+
+      if (secondarySubField) {
+        const secondaryText = selectedMsgs
+          .map((m) => m.secondary_subtitle)
+          .filter(Boolean)
+          .join(' ')
+        if (secondaryText) {
+          const existing = targetNote.fields[secondarySubField]?.value ?? ''
+          fieldUpdates[secondarySubField] = preserveHtmlTags(existing, secondaryText)
         }
       }
 
@@ -936,6 +975,11 @@
           @click="toggleSelection(message, index)"
         >
           <span class="subtitle-text" :style="{ fontSize: settings.display.subtitleFontSize + '%' }">{{ message.subtitle }}</span>
+          <span
+            v-if="message.showSecondary && message.secondary_subtitle"
+            class="secondary-sub-text"
+            :style="{ fontSize: (settings.display.subtitleFontSize * 0.85) + '%' }"
+          >{{ message.secondary_subtitle }}</span>
           <div class="actions">
             <div class="thumb-action">
               <button
@@ -994,6 +1038,25 @@
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
                 <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+              </svg>
+            </button>
+            <button
+              v-if="message.secondary_subtitle"
+              class="icon-btn"
+              :class="{ active: message.showSecondary }"
+              title="Toggle secondary subtitle"
+              @click.stop="message.showSecondary = !message.showSecondary"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
               </svg>
             </button>
           </div>
@@ -1178,6 +1241,22 @@
                         {{ field }}
                       </option>
                     </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Alt sentence field</span>
+                    <select
+                      :value="localSettings.secondarySubField"
+                      @change="
+                        (e) => onFieldChange('secondarySubField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't update</option>
+                      <option v-for="field in availableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                    <small class="field-hint">Secondary subtitle text (e.g. translation)</small>
                   </label>
 
                   <label class="form-group">
@@ -1964,6 +2043,22 @@
     display: block;
     margin-top: 0.5rem;
     text-align: left;
+  }
+
+  .secondary-sub-text {
+    display: block;
+    color: #8ab4d4;
+    font-style: italic;
+    margin-top: 3px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .message-row {
+    flex-wrap: wrap;
   }
 
   .range-input {

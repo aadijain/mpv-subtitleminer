@@ -24,6 +24,12 @@ struct Args {
     /// Validate that the IPC socket belongs to this mpv PID
     #[arg(long)]
     expected_mpv_pid: Option<u32>,
+
+    /// Tolerance (in seconds) applied to the overlap check when matching primary
+    /// and secondary subtitle lines. Two lines match if their time ranges overlap
+    /// within this many seconds. (default: 0.5)
+    #[arg(long, default_value_t = 0.5)]
+    secondary_match_threshold: f64,
 }
 
 #[tokio::main]
@@ -35,7 +41,7 @@ async fn main() {
     media::init_ffmpeg_path(&args.ffmpeg_path);
     log::info!("Using ffmpeg: {}", args.ffmpeg_path);
 
-    if let Err(e) = run_server(&args.socket_path, args.port, args.expected_mpv_pid).await {
+    if let Err(e) = run_server(&args.socket_path, args.port, args.expected_mpv_pid, args.secondary_match_threshold).await {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
