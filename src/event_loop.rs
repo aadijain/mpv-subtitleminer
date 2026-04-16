@@ -56,8 +56,8 @@ impl SharedState {
 struct PendingPrimary {
     id: u64,
     text: String,
-    // indices: 0=sub_start, 1=sub_end, 2=path, 3=aid
-    responses: [Option<serde_json::Value>; 4],
+    // indices: 0=sub_start, 1=sub_end, 2=path, 3=aid, 4=sub_delay
+    responses: [Option<serde_json::Value>; 5],
 }
 
 impl PendingPrimary {
@@ -66,7 +66,7 @@ impl PendingPrimary {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 4 {
+        if index < 5 {
             self.responses[index] = Some(value);
         }
     }
@@ -75,21 +75,26 @@ impl PendingPrimary {
         self.responses.iter().all(|r| r.is_some())
     }
 
+    fn sub_delay(&self) -> f64 {
+        self.responses[4].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
+    }
+
     fn sub_start(&self) -> Option<f64> {
-        self.responses[0].as_ref()?.as_f64()
+        Some(self.responses[0].as_ref()?.as_f64()? + self.sub_delay())
     }
 
     fn sub_end(&self) -> Option<f64> {
-        self.responses[1].as_ref()?.as_f64()
+        Some(self.responses[1].as_ref()?.as_f64()? + self.sub_delay())
     }
 
     fn into_subtitle(self, secondary_text: Option<String>) -> Subtitle {
+        let delay = self.sub_delay();
         Subtitle {
             id: self.id,
             text: self.text,
             secondary_text,
-            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap(),
-            sub_end:   self.responses[1].as_ref().unwrap().as_f64().unwrap(),
+            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
+            sub_end:   self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
             media_path: self.responses[2].as_ref().unwrap().as_str().unwrap().to_string(),
             aid: self.responses[3].as_ref().unwrap().as_i64().unwrap(),
         }
@@ -100,8 +105,8 @@ impl PendingPrimary {
 
 struct PendingSecondary {
     text: String,
-    // indices: 0=secondary-sub-start, 1=secondary-sub-end
-    responses: [Option<serde_json::Value>; 2],
+    // indices: 0=secondary-sub-start, 1=secondary-sub-end, 2=secondary-sub-delay
+    responses: [Option<serde_json::Value>; 3],
 }
 
 impl PendingSecondary {
@@ -110,7 +115,7 @@ impl PendingSecondary {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 2 {
+        if index < 3 {
             self.responses[index] = Some(value);
         }
     }
@@ -119,12 +124,16 @@ impl PendingSecondary {
         self.responses.iter().all(|r| r.is_some())
     }
 
+    fn sub_delay(&self) -> f64 {
+        self.responses[2].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
+    }
+
     fn sub_start(&self) -> Option<f64> {
-        self.responses[0].as_ref()?.as_f64()
+        Some(self.responses[0].as_ref()?.as_f64()? + self.sub_delay())
     }
 
     fn sub_end(&self) -> Option<f64> {
-        self.responses[1].as_ref()?.as_f64()
+        Some(self.responses[1].as_ref()?.as_f64()? + self.sub_delay())
     }
 }
 
@@ -391,9 +400,10 @@ async fn handle_mpv(
                 if let Some(d) = data {
                     s.set_response(prop_idx, d);
                 } else {
-                    // secondary-sub-start/end returns an error when no secondary line
-                    // is active. Mark ready with a sentinel so it doesn't block.
-                    s.set_response(prop_idx, serde_json::Value::from(f64::MAX));
+                    // secondary-sub-start/end errors when no secondary line is active.
+                    // Use sentinel for timing indices; default delay to 0.
+                    let fallback = if prop_idx < 2 { f64::MAX } else { 0.0 };
+                    s.set_response(prop_idx, serde_json::Value::from(fallback));
                 }
                 if s.is_ready() {
                     let s_start = pending_secondary[&base_id].sub_start().unwrap_or(f64::MAX);
@@ -474,10 +484,12 @@ async fn handle_mpv(
             let cmd = format!(
                 concat!(
                     "{{\"command\":[\"get_property\",\"secondary-sub-start\"],\"request_id\":{0}}}\n",
-                    "{{\"command\":[\"get_property\",\"secondary-sub-end\"],\"request_id\":{1}}}\n"
+                    "{{\"command\":[\"get_property\",\"secondary-sub-end\"],\"request_id\":{1}}}\n",
+                    "{{\"command\":[\"get_property\",\"secondary-sub-delay\"],\"request_id\":{2}}}\n"
                 ),
                 base_id,
-                base_id + 1
+                base_id + 1,
+                base_id + 2
             );
             mpv.write_all(cmd.as_bytes()).await?;
             pending_secondary.insert(base_id, PendingSecondary::new(text));
@@ -501,12 +513,14 @@ async fn handle_mpv(
                         "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
                         "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
                         "{{\"command\":[\"get_property\",\"path\"],\"request_id\":{2}}}\n",
-                        "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{3}}}\n"
+                        "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{3}}}\n",
+                        "{{\"command\":[\"get_property\",\"sub-delay\"],\"request_id\":{4}}}\n"
                     ),
                     base_id,
                     base_id + 1,
                     base_id + 2,
-                    base_id + 3
+                    base_id + 3,
+                    base_id + 4
                 );
 
                 mpv.write_all(cmd.as_bytes()).await?;
