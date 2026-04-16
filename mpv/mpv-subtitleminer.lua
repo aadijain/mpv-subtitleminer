@@ -5,9 +5,13 @@ local opts = {
   -- Either adjust settings here OR in script-opts/mpv-subtitleminer.conf
   -- ========== SETTINGS ==========
   -- List of ports to try starting the server on.
-  ports = { 61777, 61778, 61779, 61780, 61781 },
+  ports = { 61777 }, -- 61778, 61779, 61780, 61781 },
   -- When true (default), starts the mpv-subtitleminer server automatically on mpv startup.
   auto_start = true,
+  -- Tolerance (in seconds) for the overlap check when matching primary and
+  -- secondary subtitle lines. Two lines match if their time ranges overlap
+  -- within this many seconds. Default: 0.5 (500ms).
+  secondary_match_threshold = 0.5,
   -- ==============================
 }
 
@@ -184,6 +188,10 @@ local function try_start_on_port(port_index)
     table.insert(args, tostring(mpv_pid))
   else
     mp.msg.warn("Could not determine mpv PID; instance validation disabled")
+  end
+  if opts.secondary_match_threshold then
+    table.insert(args, "--secondary-match-threshold")
+    table.insert(args, tostring(opts.secondary_match_threshold))
   end
 
   server_process = mp.command_native_async({
