@@ -257,21 +257,17 @@
   function cleanSentence(text: string): string {
     const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
     if (!sentenceCleanRegexEnabled || !sentenceCleanRegex) return text
-    try {
-      return text.replace(new RegExp(sentenceCleanRegex, 'gm'), '').trim()
-    } catch {
-      return text
-    }
+    return sentenceCleanRegex.split('\n').filter(Boolean).reduce((t, pat) => {
+      try { return t.replace(new RegExp(pat, 'gm'), '') } catch { return t }
+    }, text).trim()
   }
 
   function cleanAltSentence(text: string): string {
     const { altSentenceCleanRegex, altSentenceCleanRegexEnabled } = settings.value.display
     if (!altSentenceCleanRegexEnabled || !altSentenceCleanRegex) return text
-    try {
-      return text.replace(new RegExp(altSentenceCleanRegex, 'gm'), '').trim()
-    } catch {
-      return text
-    }
+    return altSentenceCleanRegex.split('\n').filter(Boolean).reduce((t, pat) => {
+      try { return t.replace(new RegExp(pat, 'gm'), '') } catch { return t }
+    }, text).trim()
   }
 
   watch(
@@ -1362,7 +1358,17 @@
 
             <section class="section">
               <div class="section-header">
-                <h3>Text processing</h3>
+                <h3>Media configuration</h3>
+              </div>
+              <MediaConfiguration
+                v-model="localMedia"
+                :default-settings="defaultSettings"
+              />
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Text settings</h3>
               </div>
               <div class="form-grid">
                 <label class="form-group" style="grid-column: 1 / -1">
@@ -1376,14 +1382,12 @@
                     </label>
                     Sentence clean regex
                   </span>
-                  <input
-                    type="text"
+                  <textarea
                     :value="localDisplay.sentenceCleanRegex"
                     :disabled="!localDisplay.sentenceCleanRegexEnabled"
                     placeholder="e.g. ^\w[\w ]+:\s+ to strip speaker names"
-                    @input="(e) => localDisplay.sentenceCleanRegex = (e.target as HTMLInputElement).value"
+                    @input="(e) => localDisplay.sentenceCleanRegex = (e.target as HTMLTextAreaElement).value"
                   />
-                  <small class="field-hint">Applied to subtitle text. Matches are stripped. Affects display and Anki export.</small>
                 </label>
                 <label class="form-group" style="grid-column: 1 / -1">
                   <span class="label-with-toggle">
@@ -1396,14 +1400,12 @@
                     </label>
                     Alt sentence clean regex
                   </span>
-                  <input
-                    type="text"
+                  <textarea
                     :value="localDisplay.altSentenceCleanRegex"
                     :disabled="!localDisplay.altSentenceCleanRegexEnabled"
                     placeholder="e.g. \(.*?\) to strip parenthetical text"
-                    @input="(e) => localDisplay.altSentenceCleanRegex = (e.target as HTMLInputElement).value"
+                    @input="(e) => localDisplay.altSentenceCleanRegex = (e.target as HTMLTextAreaElement).value"
                   />
-                  <small class="field-hint">Applied to alt (secondary) subtitle text. Matches are stripped. Affects display and Anki export.</small>
                 </label>
                 <label class="form-group" style="grid-column: 1 / -1">
                   <span class="label-with-toggle">
@@ -1423,19 +1425,9 @@
                     placeholder="Leave empty to use the full filename"
                     @input="(e) => localDisplay.mediaFilenameRegex = (e.target as HTMLInputElement).value"
                   />
-                  <small class="field-hint">Applied globally to the filename (extension removed) to derive the page title. Matches are stripped.</small>
                 </label>
+                <small class="field-hint" style="grid-column: 1 / -1">Regex matches are stripped. One pattern per line for sentence fields. Affects display and Anki export. Filename regex is applied to the full filename (extension removed).</small>
               </div>
-            </section>
-
-            <section class="section">
-              <div class="section-header">
-                <h3>Media configuration</h3>
-              </div>
-              <MediaConfiguration 
-                v-model="localMedia" 
-                :default-settings="defaultSettings"
-              />
             </section>
           </div>
 
@@ -2030,7 +2022,8 @@
   }
 
   .form-group select,
-  .form-group input {
+  .form-group input,
+  .form-group textarea {
     background: #0c0f14;
     border: 1px solid #1f252e;
     color: #e9edf2;
@@ -2038,7 +2031,15 @@
     border-radius: 6px;
   }
 
-  .form-group input:disabled {
+  .form-group textarea {
+    resize: vertical;
+    min-height: 60px;
+    font-family: monospace;
+    font-size: 0.9em;
+  }
+
+  .form-group input:disabled,
+  .form-group textarea:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
