@@ -11,16 +11,6 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use crate::media::FfmpegRequest;
 use crate::mpv_stream::MpvStream;
 
-/// How many unmatched secondaries to hold before dropping the oldest.
-const MAX_UNMATCHED_SECONDARY: usize = 3;
-
-/// If an unmatched secondary starts within this many seconds of the end of the
-/// last successfully matched secondary, append it to that card instead of
-/// dropping it.  Handles translation tracks whose lines don't align 1-to-1 with
-/// the primary but continue the same sentence.
-const SECONDARY_MERGE_GAP: f64 = 2.0;
-
-
 #[derive(Clone)]
 pub struct Subtitle {
     pub id: u64,
@@ -301,6 +291,7 @@ pub async fn run_server(
     port: u16,
     expected_mpv_pid: Option<u32>,
     secondary_match_threshold: f64,
+    append_secondary: bool,
     primary_filter: StyleFilter,
     secondary_filter: StyleFilter,
 ) -> std::io::Result<()> {
@@ -337,6 +328,7 @@ pub async fn run_server(
             mpv_state,
             mpv_tx,
             secondary_match_threshold,
+            append_secondary,
             primary_filter,
             secondary_filter,
         ).await {
@@ -366,27 +358,12 @@ pub async fn run_server(
     }
 }
 
-/// Adds a secondary to the wait buffer. Returns the evicted entry (base_id, start, end)
-/// if the buffer was full, so the caller can decide whether to append or drop it.
-fn push_ready_secondary(
-    ready_secondary: &mut Vec<(u64, f64, f64)>,
-    base_id: u64,
-    s_start: f64,
-    s_end: f64,
-) -> Option<(u64, f64, f64)> {
-    ready_secondary.push((base_id, s_start, s_end));
-    if ready_secondary.len() > MAX_UNMATCHED_SECONDARY {
-        Some(ready_secondary.remove(0))
-    } else {
-        None
-    }
-}
-
 async fn handle_mpv(
     mut mpv: MpvStream,
     state: Arc<SharedState>,
     tx: broadcast::Sender<SubtitleEvent>,
     secondary_match_threshold: f64,
+    append_secondary: bool,    
     primary_filter: StyleFilter,
     secondary_filter: StyleFilter,
 ) -> std::io::Result<()> {
@@ -401,18 +378,16 @@ async fn handle_mpv(
     let mut pending_primary: HashMap<u64, PendingPrimary> = HashMap::new();
     let mut pending_secondary: HashMap<u64, PendingSecondary> = HashMap::new();
 
-    // Secondaries that are ready but found no match at arrival time.
-    // Held briefly so a primary that resolves slightly later can still claim them.
-    // Vec<(base_id, sub_start, sub_end)>
-    let mut ready_secondary: Vec<(u64, f64, f64)> = Vec::new();
+    // A single secondary whose get_property batch resolved before any matching
+    // primary. Held only to cover the response-ordering race; under normal
+    // playback it is claimed by the next primary or replaced by the next
+    // secondary.
+    let mut orphan_secondary: Option<(u64, f64, f64)> = None;
 
-    // The most recently emitted primary: (subtitle_id, sub_start, sub_end).
-    // A secondary that resolves slightly after its primary will find it here.
-    let mut last_primary: Option<(u64, f64, f64)> = None;
-
-    // Last primary whose secondary was successfully matched: (prim_id, s_start, s_end).
-    // Used to merge close-following secondaries that don't overlap any primary.
-    let mut last_matched_secondary: Option<(u64, f64, f64)> = None;
+    // The most recently emitted primary: (subtitle_id, sub_start, sub_end, has_secondary).
+    // `has_secondary` flips true on the first secondary match so subsequent
+    // overlapping secondaries emit SecondaryAppend instead of SecondaryUpdate.
+    let mut last_primary: Option<(u64, f64, f64, bool)> = None;
 
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -470,25 +445,23 @@ async fn handle_mpv(
                     // Emit immediately — secondary arrives via SecondaryUpdate.
                     emit(primary, None, &state, &tx).await;
 
-                    // Check if a secondary was already waiting for this primary.
-                    let sec_pos = ready_secondary.iter().position(|(_, ss, se)| {
-                        ranges_overlap(sub_start, sub_end, *ss, *se, secondary_match_threshold)
-                    });
-                    if let Some(pos) = sec_pos {
-                        let (s_base, ss, se) = ready_secondary.remove(pos);
+                    // Did a secondary land just before this primary's batch finished?
+                    let claimed_orphan = orphan_secondary
+                        .filter(|(_, ss, se)| {
+                            ranges_overlap(sub_start, sub_end, *ss, *se, secondary_match_threshold)
+                        });
+                    let mut has_secondary = false;
+                    if let Some((s_base, _, _)) = claimed_orphan {
+                        orphan_secondary = None;
                         if let Some(sec) = pending_secondary.remove(&s_base) {
                             if !sec.text.is_empty() {
                                 let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: subtitle_id, text: sec.text });
-                                last_matched_secondary = Some((subtitle_id, ss, se));
-                                // Primary is matched; don't expose it for a second secondary.
-                                last_primary = None;
-                                continue;
+                                has_secondary = true;
                             }
                         }
                     }
 
-                    // No secondary yet — remember this primary for a late-arriving secondary.
-                    last_primary = Some((subtitle_id, sub_start, sub_end));
+                    last_primary = Some((subtitle_id, sub_start, sub_end, has_secondary));
                 }
             } else if let Some(s) = pending_secondary.get_mut(&base_id) {
                 if let Some(d) = data {
@@ -519,40 +492,43 @@ async fn handle_mpv(
 
                     let s_end = pending_secondary[&base_id].sub_end().unwrap_or(s_start);
 
-                    // Try to match against the last emitted primary.
-                    let matched_primary = last_primary.filter(|(_, p_start, p_end)| {
-                        ranges_overlap(*p_start, *p_end, s_start, s_end, secondary_match_threshold)
-                    });
+                    let overlaps_last = last_primary
+                        .as_ref()
+                        .map(|(_, p_start, p_end, _)| {
+                            ranges_overlap(*p_start, *p_end, s_start, s_end, secondary_match_threshold)
+                        })
+                        .unwrap_or(false);
 
-                    if let Some((prim_id, _, _)) = matched_primary {
-                        last_primary = None;
+                    if overlaps_last {
+                        let (prim_id, _, _, has_secondary) = last_primary.as_mut().unwrap();
+                        let prim_id = *prim_id;
+                        let already_matched = *has_secondary;
+                        // Mark before the early-drop checks so a subsequent overlapping
+                        // secondary still sees the primary as "claimed" even if this one
+                        // happens to be empty or suppressed.
+                        *has_secondary = true;
+
                         let sec = pending_secondary.remove(&base_id).unwrap();
-                        if !sec.text.is_empty() {
+                        if sec.text.is_empty() {
+                            continue;
+                        }
+                        if already_matched {
+                            if append_secondary {
+                                debug!("[sub:{}] Secondary append", prim_id);
+                                let _ = tx.send(SubtitleEvent::SecondaryAppend { id: prim_id, text: sec.text });
+                            } else {
+                                debug!("[sub:{}] Secondary append suppressed (flag off)", prim_id);
+                            }
+                        } else {
                             debug!("[sub:{}] Secondary match", prim_id);
                             let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: prim_id, text: sec.text });
-                            last_matched_secondary = Some((prim_id, s_start, s_end));
                         }
                     } else {
-                        // Buffer and wait for the next primary to claim it.
-                        // Only append to a previous card if the buffer is full and it's about to be dropped.
-                        if let Some((evicted_base, ev_start, ev_end)) =
-                            push_ready_secondary(&mut ready_secondary, base_id, s_start, s_end)
-                        {
-                            let appended = if let Some((prev_id, _, prev_end)) = last_matched_secondary {
-                                if ev_start - prev_end <= SECONDARY_MERGE_GAP {
-                                    if let Some(sec) = pending_secondary.remove(&evicted_base) {
-                                        if !sec.text.is_empty() {
-                                            debug!("[sub:{}] Appending evicted secondary (gap {:.2}s)", prev_id, ev_start - prev_end);
-                                            let _ = tx.send(SubtitleEvent::SecondaryAppend { id: prev_id, text: sec.text });
-                                            last_matched_secondary = Some((prev_id, ev_start, ev_end));
-                                            true
-                                        } else { false }
-                                    } else { false }
-                                } else { false }
-                            } else { false };
-
-                            if !appended {
-                                pending_secondary.remove(&evicted_base);
+                        // No matching primary yet — hold for the upcoming one.
+                        // Only one orphan slot; replace any existing entry.
+                        if let Some((prev_base, _, _)) = orphan_secondary.replace((base_id, s_start, s_end)) {
+                            if prev_base != base_id {
+                                pending_secondary.remove(&prev_base);
                                 debug!("Dropped unmatched secondary subtitle");
                             }
                         }

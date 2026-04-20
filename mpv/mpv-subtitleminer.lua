@@ -7,6 +7,7 @@ local opts = {
   ports = { 61777, 61778, 61779, 61780, 61781 },
   auto_start = true,
   secondary_match_threshold = 0.5,
+  append_secondary = true,
   style_blocklist_primary = "",
   style_allowlist_primary = "Default",
   name_blocklist_primary = "",
@@ -195,6 +196,8 @@ local function try_start_on_port(port_index)
     table.insert(args, "--secondary-match-threshold")
     table.insert(args, tostring(opts.secondary_match_threshold))
   end
+  table.insert(args, "--append-secondary")
+  table.insert(args, tostring(opts.append_secondary))
   table.insert(args, "--style-blocklist-primary")
   table.insert(args, tostring(opts.style_blocklist_primary))
   table.insert(args, "--style-allowlist-primary")

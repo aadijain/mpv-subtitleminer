@@ -31,6 +31,14 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     secondary_match_threshold: f64,
 
+    /// When multiple secondary subtitle lines overlap a single primary, emit
+    /// each additional line as a `secondary_append` event so the UI can
+    /// concatenate them onto the same card. With this off, only the first
+    /// overlapping secondary is emitted; subsequent ones are dropped.
+    /// (default: true)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 1)]
+    append_secondary: bool,
+
     /// Comma-separated ASS Style values to drop on the primary subtitle track.
     #[arg(long, default_value = "")]
     style_blocklist_primary: String,
@@ -104,6 +112,7 @@ async fn main() {
         args.port,
         args.expected_mpv_pid,
         args.secondary_match_threshold,
+        args.append_secondary,
         primary_filter,
         secondary_filter,
     ).await {
