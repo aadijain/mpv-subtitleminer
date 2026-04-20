@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - *(fork)* Clear Screen button.
 - *(fork)* Page title updates based on currently playing media file name.
 - *(fork)* Parse subtitle text before exporting to Anki. (strip speaker names, annotations, etc.)
+- *(fork)* Filter subtitle lines by ASS Style/Name field using per-track blocklists and allowlists.
 
 ## Downloads
 

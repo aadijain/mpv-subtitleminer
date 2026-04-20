@@ -43,6 +43,61 @@ struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
 }
 
+/// Drops subtitle lines based on their ASS Dialogue metadata fields.
+#[derive(Clone, Default)]
+pub struct StyleFilter {
+    /// Drop lines whose Style field matches any of these entries.
+    pub style_blocklist: Vec<String>,
+    /// If non-empty, drop lines whose Style field does NOT match any entry.
+    pub style_allowlist: Vec<String>,
+    /// Drop lines whose Name field exactly matches any of these entries.
+    pub name_blocklist: Vec<String>,
+    /// If non-empty, drop lines whose Name field does NOT match any entry.
+    pub name_allowlist: Vec<String>,
+}
+
+impl StyleFilter {
+    fn is_active(&self) -> bool {
+        !self.style_blocklist.is_empty()
+            || !self.style_allowlist.is_empty()
+            || !self.name_blocklist.is_empty()
+            || !self.name_allowlist.is_empty()
+    }
+
+    fn should_drop(&self, ass_full: &str) -> bool {
+        let Some((style, name)) = parse_ass_dialogue_meta(ass_full) else {
+            return false;
+        };
+        if !self.style_allowlist.is_empty() && !self.style_allowlist.iter().any(|s| s == style) {
+            return true;
+        }
+        if self.style_blocklist.iter().any(|s| s == style) {
+            return true;
+        }
+        if !self.name_allowlist.is_empty() && !self.name_allowlist.iter().any(|n| n == name) {
+            return true;
+        }
+        if self.name_blocklist.iter().any(|n| n == name) {
+            return true;
+        }
+        false
+    }
+}
+
+/// Extracts (Style, Name) from the value mpv returns for `sub-text/ass-full`,
+/// which is a Dialogue line: `Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
+/// Strips a leading `Dialogue: ` if mpv includes it.
+fn parse_ass_dialogue_meta(s: &str) -> Option<(&str, &str)> {
+    let s = s.strip_prefix("Dialogue: ").unwrap_or(s);
+    let mut parts = s.splitn(10, ',');
+    parts.next()?; // Layer
+    parts.next()?; // Start
+    parts.next()?; // End
+    let style = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    Some((style, name))
+}
+
 impl SharedState {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -56,23 +111,34 @@ impl SharedState {
 struct PendingPrimary {
     id: u64,
     text: String,
-    // indices: 0=sub_start, 1=sub_end, 2=path, 3=aid, 4=sub_delay
-    responses: [Option<serde_json::Value>; 5],
+    // indices: 0=sub_start, 1=sub_end, 2=path, 3=aid, 4=sub_delay, 5=sub-text/ass-full (optional)
+    responses: [Option<serde_json::Value>; 6],
 }
 
 impl PendingPrimary {
-    fn new(id: u64, text: String) -> Self {
-        Self { id, text, responses: Default::default() }
+    fn new(id: u64, text: String, query_ass_full: bool) -> Self {
+        let mut responses: [Option<serde_json::Value>; 6] = Default::default();
+        if !query_ass_full {
+            // Pre-fill the ass-full slot so is_ready() doesn't wait for a query we never sent.
+            responses[5] = Some(serde_json::Value::Null);
+        }
+        Self { id, text, responses }
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 5 {
+        if index < 6 {
             self.responses[index] = Some(value);
         }
     }
 
     fn is_ready(&self) -> bool {
         self.responses.iter().all(|r| r.is_some())
+    }
+
+    /// The raw `sub-text/ass-full` Dialogue line, if mpv returned a string for it.
+    /// Returns None when the query was skipped or mpv returned an error/non-string.
+    fn ass_full(&self) -> Option<&str> {
+        self.responses[5].as_ref().and_then(|v| v.as_str())
     }
 
     fn sub_delay(&self) -> f64 {
@@ -105,23 +171,32 @@ impl PendingPrimary {
 
 struct PendingSecondary {
     text: String,
-    // indices: 0=secondary-sub-start, 1=secondary-sub-end, 2=secondary-sub-delay
-    responses: [Option<serde_json::Value>; 3],
+    // indices: 0=secondary-sub-start, 1=secondary-sub-end, 2=secondary-sub-delay,
+    //          3=secondary-sub-text/ass-full (optional)
+    responses: [Option<serde_json::Value>; 4],
 }
 
 impl PendingSecondary {
-    fn new(text: String) -> Self {
-        Self { text, responses: Default::default() }
+    fn new(text: String, query_ass_full: bool) -> Self {
+        let mut responses: [Option<serde_json::Value>; 4] = Default::default();
+        if !query_ass_full {
+            responses[3] = Some(serde_json::Value::Null);
+        }
+        Self { text, responses }
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 3 {
+        if index < 4 {
             self.responses[index] = Some(value);
         }
     }
 
     fn is_ready(&self) -> bool {
         self.responses.iter().all(|r| r.is_some())
+    }
+
+    fn ass_full(&self) -> Option<&str> {
+        self.responses[3].as_ref().and_then(|v| v.as_str())
     }
 
     fn sub_delay(&self) -> f64 {
@@ -226,6 +301,8 @@ pub async fn run_server(
     port: u16,
     expected_mpv_pid: Option<u32>,
     secondary_match_threshold: f64,
+    primary_filter: StyleFilter,
+    secondary_filter: StyleFilter,
 ) -> std::io::Result<()> {
     let mut mpv = MpvStream::connect(socket_path).await?;
     if let Some(expected) = expected_mpv_pid {
@@ -255,7 +332,14 @@ pub async fn run_server(
     let mpv_state = state.clone();
     let mpv_tx = subtitle_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = handle_mpv(mpv, mpv_state, mpv_tx, secondary_match_threshold).await {
+        if let Err(e) = handle_mpv(
+            mpv,
+            mpv_state,
+            mpv_tx,
+            secondary_match_threshold,
+            primary_filter,
+            secondary_filter,
+        ).await {
             error!("MPV handler error: {}", e);
         }
         info!("MPV connection closed, shutting down.");
@@ -303,6 +387,8 @@ async fn handle_mpv(
     state: Arc<SharedState>,
     tx: broadcast::Sender<SubtitleEvent>,
     secondary_match_threshold: f64,
+    primary_filter: StyleFilter,
+    secondary_filter: StyleFilter,
 ) -> std::io::Result<()> {
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
@@ -373,6 +459,14 @@ async fn handle_mpv(
                         continue;
                     }
 
+                    // Drop lines whose ASS Style/Name fields match the configured filter.
+                    if let Some(ass_full) = primary.ass_full() {
+                        if primary_filter.should_drop(ass_full) {
+                            debug!("[sub:{}] dropped (style/name filter)", subtitle_id);
+                            continue;
+                        }
+                    }
+
                     // Emit immediately — secondary arrives via SecondaryUpdate.
                     emit(primary, None, &state, &tx).await;
 
@@ -412,6 +506,15 @@ async fn handle_mpv(
                     if s_start == f64::MAX {
                         pending_secondary.remove(&base_id);
                         continue;
+                    }
+
+                    // Drop lines whose ASS Style/Name fields match the configured filter.
+                    if let Some(ass_full) = pending_secondary[&base_id].ass_full() {
+                        if secondary_filter.should_drop(ass_full) {
+                            pending_secondary.remove(&base_id);
+                            debug!("Dropped secondary (style/name filter)");
+                            continue;
+                        }
                     }
 
                     let s_end = pending_secondary[&base_id].sub_end().unwrap_or(s_start);
@@ -481,7 +584,7 @@ async fn handle_mpv(
             let base_id = next_request_id;
             next_request_id += 10;
 
-            let cmd = format!(
+            let mut cmd = format!(
                 concat!(
                     "{{\"command\":[\"get_property\",\"secondary-sub-start\"],\"request_id\":{0}}}\n",
                     "{{\"command\":[\"get_property\",\"secondary-sub-end\"],\"request_id\":{1}}}\n",
@@ -491,8 +594,15 @@ async fn handle_mpv(
                 base_id + 1,
                 base_id + 2
             );
+            let query_ass_full = secondary_filter.is_active();
+            if query_ass_full {
+                cmd.push_str(&format!(
+                    "{{\"command\":[\"get_property\",\"secondary-sub-text/ass-full\"],\"request_id\":{}}}\n",
+                    base_id + 3
+                ));
+            }
             mpv.write_all(cmd.as_bytes()).await?;
-            pending_secondary.insert(base_id, PendingSecondary::new(text));
+            pending_secondary.insert(base_id, PendingSecondary::new(text, query_ass_full));
             continue;
         }
 
@@ -508,7 +618,7 @@ async fn handle_mpv(
                 let base_id = next_request_id;
                 next_request_id += 10;
 
-                let cmd = format!(
+                let mut cmd = format!(
                     concat!(
                         "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
                         "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
@@ -522,9 +632,19 @@ async fn handle_mpv(
                     base_id + 3,
                     base_id + 4
                 );
+                let query_ass_full = primary_filter.is_active();
+                if query_ass_full {
+                    cmd.push_str(&format!(
+                        "{{\"command\":[\"get_property\",\"sub-text/ass-full\"],\"request_id\":{}}}\n",
+                        base_id + 5
+                    ));
+                }
 
                 mpv.write_all(cmd.as_bytes()).await?;
-                pending_primary.insert(base_id, PendingPrimary::new(subtitle_id, text.to_string()));
+                pending_primary.insert(
+                    base_id,
+                    PendingPrimary::new(subtitle_id, text.to_string(), query_ass_full),
+                );
                 info!("[sub:{}] {}", subtitle_id, text);
             }
         }
