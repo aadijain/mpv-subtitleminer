@@ -54,10 +54,43 @@ impl StyleFilter {
             || !self.name_allowlist.is_empty()
     }
 
-    fn should_drop(&self, ass_full: &str) -> bool {
-        let Some((style, name)) = parse_ass_dialogue_meta(ass_full) else {
-            return false;
-        };
+    /// Applies per-line filtering to `ass_full` (newline-separated Dialogue entries from mpv).
+    /// Returns the plain-text survivors from `sub_text` joined by `\n`, or `None` if every
+    /// parseable Dialogue line was dropped. Unparseable lines and non-ASS tracks pass through.
+    fn filter(&self, ass_full: &str, sub_text: &str) -> Option<String> {
+        let text_lines: Vec<&str> = sub_text.lines().collect();
+        let mut kept: Vec<String> = Vec::new();
+        let mut any_parsed = false;
+        let mut cursor = 0usize;
+
+        for dialogue in ass_full.lines() {
+            match parse_ass_dialogue(dialogue) {
+                None => {
+                    if let Some(line) = text_lines.get(cursor) {
+                        kept.push((*line).to_string());
+                    }
+                    cursor += 1;
+                }
+                Some((style, name, text)) => {
+                    any_parsed = true;
+                    let n = ass_visible_line_count(text);
+                    let end = (cursor + n).min(text_lines.len());
+                    if !self.line_should_drop(style, name) {
+                        kept.push(text_lines[cursor..end].join("\n"));
+                    }
+                    cursor = end;
+                }
+            }
+        }
+
+        match (any_parsed, kept.is_empty()) {
+            (false, _) => Some(sub_text.to_string()), // no ASS metadata → pass through
+            (true, true) => None,                      // all lines filtered
+            (true, false) => Some(kept.join("\n")),
+        }
+    }
+
+    fn line_should_drop(&self, style: &str, name: &str) -> bool {
         if !self.style_allowlist.is_empty() && !self.style_allowlist.iter().any(|s| s == style) {
             return true;
         }
@@ -74,10 +107,9 @@ impl StyleFilter {
     }
 }
 
-/// Extracts (Style, Name) from the value mpv returns for `sub-text/ass-full`,
-/// which is a Dialogue line: `Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
-/// Strips a leading `Dialogue: ` if mpv includes it.
-fn parse_ass_dialogue_meta(s: &str) -> Option<(&str, &str)> {
+/// Extracts (Style, Name, Text) from a single ASS Dialogue line:
+/// `[Dialogue: ]Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`
+fn parse_ass_dialogue(s: &str) -> Option<(&str, &str, &str)> {
     let s = s.strip_prefix("Dialogue: ").unwrap_or(s);
     let mut parts = s.splitn(10, ',');
     parts.next()?; // Layer
@@ -85,7 +117,29 @@ fn parse_ass_dialogue_meta(s: &str) -> Option<(&str, &str)> {
     parts.next()?; // End
     let style = parts.next()?.trim();
     let name = parts.next()?.trim();
-    Some((style, name))
+    parts.next()?; // MarginL
+    parts.next()?; // MarginR
+    parts.next()?; // MarginV
+    parts.next()?; // Effect
+    let text = parts.next()?;
+    Some((style, name, text))
+}
+
+/// Number of visible lines the ASS dialogue text renders as. Each `\N` (hard
+/// newline) adds a line; `{...}` override blocks are stripped first so any
+/// `\N` inside them doesn't count.
+fn ass_visible_line_count(text: &str) -> usize {
+    let mut stripped = String::with_capacity(text.len());
+    let mut in_override = false;
+    for c in text.chars() {
+        match c {
+            '{' => in_override = true,
+            '}' => in_override = false,
+            _ if !in_override => stripped.push(c),
+            _ => {}
+        }
+    }
+    1 + stripped.matches("\\N").count()
 }
 
 impl SharedState {
@@ -426,7 +480,7 @@ async fn handle_mpv(
                 if p.is_ready() {
                     let sub_start = pending_primary[&base_id].sub_start().unwrap_or(f64::MAX);
                     let sub_end = pending_primary[&base_id].sub_end().unwrap_or(sub_start);
-                    let primary = pending_primary.remove(&base_id).unwrap();
+                    let mut primary = pending_primary.remove(&base_id).unwrap();
                     let subtitle_id = primary.id;
 
                     // Discard if timing is invalid (IPC error on sub-start/end).
@@ -434,11 +488,14 @@ async fn handle_mpv(
                         continue;
                     }
 
-                    // Drop lines whose ASS Style/Name fields match the configured filter.
-                    if let Some(ass_full) = primary.ass_full() {
-                        if primary_filter.should_drop(ass_full) {
-                            debug!("[sub:{}] dropped (style/name filter)", subtitle_id);
-                            continue;
+                    // Filter out ASS lines that match the style/name filter; keep survivors.
+                    if let Some(ass_full) = primary.ass_full().map(str::to_owned) {
+                        match primary_filter.filter(&ass_full, &primary.text) {
+                            None => {
+                                debug!("[sub:{}] dropped (style/name filter)", subtitle_id);
+                                continue;
+                            }
+                            Some(filtered) => primary.text = filtered,
                         }
                     }
 
@@ -481,12 +538,16 @@ async fn handle_mpv(
                         continue;
                     }
 
-                    // Drop lines whose ASS Style/Name fields match the configured filter.
-                    if let Some(ass_full) = pending_secondary[&base_id].ass_full() {
-                        if secondary_filter.should_drop(ass_full) {
-                            pending_secondary.remove(&base_id);
-                            debug!("Dropped secondary (style/name filter)");
-                            continue;
+                    // Filter out ASS lines that match the style/name filter; keep survivors.
+                    if let Some(ass_full) = pending_secondary[&base_id].ass_full().map(str::to_owned) {
+                        let sub_text = pending_secondary[&base_id].text.clone();
+                        match secondary_filter.filter(&ass_full, &sub_text) {
+                            None => {
+                                pending_secondary.remove(&base_id);
+                                debug!("Dropped secondary (style/name filter)");
+                                continue;
+                            }
+                            Some(filtered) => pending_secondary.get_mut(&base_id).unwrap().text = filtered,
                         }
                     }
 
