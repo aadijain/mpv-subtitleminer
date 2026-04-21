@@ -438,10 +438,12 @@ async fn handle_mpv(
     // secondary.
     let mut orphan_secondary: Option<(u64, f64, f64)> = None;
 
-    // The most recently emitted primary: (subtitle_id, sub_start, sub_end, has_secondary).
-    // `has_secondary` flips true on the first secondary match so subsequent
-    // overlapping secondaries emit SecondaryAppend instead of SecondaryUpdate.
-    let mut last_primary: Option<(u64, f64, f64, bool)> = None;
+    // The most recently emitted primary: (subtitle_id, sub_start, sub_end, last_secondary).
+    // `last_secondary` is None until the first secondary match, then holds the
+    // most recently emitted secondary piece — used both to decide Update vs
+    // Append and to skip appends that repeat the prior piece (mpv re-reports
+    // the same Dialogue when a neighboring one appears/expires).
+    let mut last_primary: Option<(u64, f64, f64, Option<String>)> = None;
 
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -507,18 +509,19 @@ async fn handle_mpv(
                         .filter(|(_, ss, se)| {
                             ranges_overlap(sub_start, sub_end, *ss, *se, secondary_match_threshold)
                         });
-                    let mut has_secondary = false;
+                    let mut last_secondary: Option<String> = None;
                     if let Some((s_base, _, _)) = claimed_orphan {
                         orphan_secondary = None;
                         if let Some(sec) = pending_secondary.remove(&s_base) {
                             if !sec.text.is_empty() {
-                                let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: subtitle_id, text: sec.text });
-                                has_secondary = true;
+                                let text = sec.text.clone();
+                                let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: subtitle_id, text });
+                                last_secondary = Some(sec.text);
                             }
                         }
                     }
 
-                    last_primary = Some((subtitle_id, sub_start, sub_end, has_secondary));
+                    last_primary = Some((subtitle_id, sub_start, sub_end, last_secondary));
                 }
             } else if let Some(s) = pending_secondary.get_mut(&base_id) {
                 if let Some(d) = data {
@@ -561,28 +564,57 @@ async fn handle_mpv(
                         .unwrap_or(false);
 
                     if overlaps_last {
-                        let (prim_id, _, _, has_secondary) = last_primary.as_mut().unwrap();
+                        let (prim_id, _, _, last_secondary) = last_primary.as_mut().unwrap();
                         let prim_id = *prim_id;
-                        let already_matched = *has_secondary;
-                        // Mark before the early-drop checks so a subsequent overlapping
-                        // secondary still sees the primary as "claimed" even if this one
-                        // happens to be empty or suppressed.
-                        *has_secondary = true;
+                        let already_matched = last_secondary.is_some();
 
-                        let sec = pending_secondary.remove(&base_id).unwrap();
-                        if sec.text.is_empty() {
+                        let sec_text_peek = pending_secondary[&base_id].text.clone();
+                        if sec_text_peek.is_empty() {
+                            // Mark the primary as claimed so a later overlapping
+                            // secondary uses the append path rather than emitting as
+                            // a first-time Update.
+                            if last_secondary.is_none() {
+                                *last_secondary = Some(String::new());
+                            }
+                            pending_secondary.remove(&base_id);
                             continue;
                         }
+
                         if already_matched {
+                            // Would-be append: prefer letting an in-flight primary claim
+                            // this instead. Park as orphan; primary-ready path consumes it.
+                            if !pending_primary.is_empty() {
+                                if let Some((prev_base, _, _)) = orphan_secondary.replace((base_id, s_start, s_end)) {
+                                    if prev_base != base_id {
+                                        pending_secondary.remove(&prev_base);
+                                        debug!("Dropped unmatched secondary subtitle");
+                                    }
+                                }
+                                debug!("[sub:{}] Secondary held for in-flight primary", prim_id);
+                                continue;
+                            }
+
+                            // Dedup: mpv re-reports the same Dialogue when a neighbor
+                            // appears/expires — skip if the piece matches what we last sent.
+                            if last_secondary.as_deref() == Some(sec_text_peek.as_str()) {
+                                pending_secondary.remove(&base_id);
+                                debug!("[sub:{}] Secondary append skipped (duplicate)", prim_id);
+                                continue;
+                            }
+
+                            let sec = pending_secondary.remove(&base_id).unwrap();
                             if append_secondary {
                                 debug!("[sub:{}] Secondary append", prim_id);
-                                let _ = tx.send(SubtitleEvent::SecondaryAppend { id: prim_id, text: sec.text });
+                                let _ = tx.send(SubtitleEvent::SecondaryAppend { id: prim_id, text: sec.text.clone() });
+                                *last_secondary = Some(sec.text);
                             } else {
                                 debug!("[sub:{}] Secondary append suppressed (flag off)", prim_id);
                             }
                         } else {
+                            let sec = pending_secondary.remove(&base_id).unwrap();
                             debug!("[sub:{}] Secondary match", prim_id);
-                            let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: prim_id, text: sec.text });
+                            let _ = tx.send(SubtitleEvent::SecondaryUpdate { id: prim_id, text: sec.text.clone() });
+                            *last_secondary = Some(sec.text);
                         }
                     } else {
                         // No matching primary yet — hold for the upcoming one.
