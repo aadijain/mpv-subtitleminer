@@ -8,6 +8,14 @@ local opts = {
   auto_start = true,
   secondary_match_threshold = 0.5,
   append_secondary = true,
+  style_blocklist_primary = "",
+  style_allowlist_primary = "Default",
+  name_blocklist_primary = "",
+  name_allowlist_primary = "",
+  style_blocklist_secondary = "",
+  style_allowlist_secondary = "Default",
+  name_blocklist_secondary = "",
+  name_allowlist_secondary = "",
 }
 
 options.read_options(opts, "mpv-subtitleminer")
@@ -190,6 +198,22 @@ local function try_start_on_port(port_index)
   end
   table.insert(args, "--append-secondary")
   table.insert(args, tostring(opts.append_secondary))
+  table.insert(args, "--style-blocklist-primary")
+  table.insert(args, tostring(opts.style_blocklist_primary))
+  table.insert(args, "--style-allowlist-primary")
+  table.insert(args, tostring(opts.style_allowlist_primary))
+  table.insert(args, "--name-blocklist-primary")
+  table.insert(args, tostring(opts.name_blocklist_primary))
+  table.insert(args, "--name-allowlist-primary")
+  table.insert(args, tostring(opts.name_allowlist_primary))
+  table.insert(args, "--style-blocklist-secondary")
+  table.insert(args, tostring(opts.style_blocklist_secondary))
+  table.insert(args, "--style-allowlist-secondary")
+  table.insert(args, tostring(opts.style_allowlist_secondary))
+  table.insert(args, "--name-blocklist-secondary")
+  table.insert(args, tostring(opts.name_blocklist_secondary))
+  table.insert(args, "--name-allowlist-secondary")
+  table.insert(args, tostring(opts.name_allowlist_secondary))
 
   server_process = mp.command_native_async({
     name = "subprocess",
