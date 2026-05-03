@@ -214,6 +214,7 @@
     audio?: string
     sourcePort: number
     uid: string
+    media_path?: string
   }
 
   const messages = ref<SubtitleMessage[]>([])
@@ -225,7 +226,25 @@
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+    document.title = 'Subtitle Tool Page'
   }
+
+  function titleFromMediaPath(mediaPath: string): string {
+    const filename = mediaPath.replace(/\\/g, '/').split('/').pop() ?? mediaPath
+    let title = filename.replace(/\.[^.]+$/, '')
+    // Remove leading [group] fansub tag e.g. "[ASW] "
+    title = title.replace(/^\[[^\]]*\]\s*/, '')
+    // Remove trailing [tag] blocks e.g. "[1080p HEVC][C88519A4]"
+    title = title.replace(/(\s*\[[^\]]*\])+$/, '')
+    // Remove trailing episode number e.g. " - 01" or " - 001"
+    title = title.replace(/\s*-\s*\d{1,3}\s*$/, '')
+    return title.trim()
+  }
+
+  watch(
+    () => messages.value[messages.value.length - 1]?.media_path,
+    (path) => { document.title = path ? titleFromMediaPath(path) : 'Subtitle Tool Page' },
+  )
   const currentAudio = ref<HTMLAudioElement | null>(null)
   const pendingAudioRange = ref<{
     startId: number
@@ -364,7 +383,8 @@
     }
     const normalizedTimePos = time_pos ?? sub_start
     const uid = `${port}-${id}`
-    return { id, subtitle, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid }
+    const media_path = asString(d.media_path) ?? undefined
+    return { id, subtitle, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid, media_path }
   }
 
   function parseMediaMessage(d: JsonObject): { id: number; data: string } | null {

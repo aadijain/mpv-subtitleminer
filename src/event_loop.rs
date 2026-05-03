@@ -314,6 +314,7 @@ async fn handle_client(
                     "subtitle": sub.text,
                     "sub_start": sub.sub_start,
                     "sub_end": sub.sub_end,
+                    "media_path": sub.media_path,
                 });
                 ws_tx.send(Message::Text(msg.to_string().into())).await?;
             }
