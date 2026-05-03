@@ -466,6 +466,19 @@ async fn handle_mpv(
             continue;
         }
 
+        // ── Seek: drop everything tied to the pre-seek timeline ───────────────
+        // mpv fires `seek` at the start of the jump. Any in-flight get_property
+        // responses still en route belong to the old position; clearing the
+        // pending maps lets them fall through the dispatch below as no-ops.
+        if json.get("event") == Some(&serde_json::json!("seek")) {
+            pending_primary.clear();
+            pending_secondary.clear();
+            orphan_secondary = None;
+            last_primary = None;
+            debug!("Seek detected, cleared subtitle match state");
+            continue;
+        }
+
         // ── Property-change events ────────────────────────────────────────────
         if json.get("event") != Some(&serde_json::json!("property-change")) {
             continue;
