@@ -30,8 +30,13 @@ export interface ConnectionSettings {
   ports: number[]
 }
 
+export interface DisplaySettings {
+  subtitleFontSize: number
+}
+
 export interface Settings {
   anki: AnkiSettings
   connection: ConnectionSettings
   media: MediaSettings
+  display: DisplaySettings
 }

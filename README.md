@@ -1,5 +1,7 @@
 # mpv-subtitleminer
 
+> **Fork** of [friedrich-de/mpv-subtitleminer](https://github.com/friedrich-de/mpv-subtitleminer) with additional features — see below.
+
 This is a tool for mpv to enable language learning with subtitle files. We send subtitles to a web-front end where you can look up words, create Anki flashcards add the sentence and media to your card. We do this by launching a local Rust server from mpv that connects the web front end to mpv via its IPC interface.
 
 **Warning**: This is an early release. Expect bugs and rough edges.
@@ -13,6 +15,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Stream subtitles to web front end and interactively look up words.
 - Anki integration via AnkiConnect: Select your note type, make a card and add media.
 - Replay sentences with audio anytime.
+- *(fork)* Adjustable font size.
 
 ## Downloads
 
