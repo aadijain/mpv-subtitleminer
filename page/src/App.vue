@@ -16,7 +16,15 @@
   const defaultSettings: Settings = {
     anki: { noteType: '', frontField: '', sentenceField: '', audioField: '', imageField: '', secondarySubField: '', maxCardAgeMinutes: 5 },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
-    display: { subtitleFontSize: 110 },
+    display: {
+      subtitleFontSize: 110,
+      mediaFilenameRegex: '^\\[.*?\\]\\s*|\\s*S\\d+E\\d+.*$',
+      mediaFilenameRegexEnabled: true,
+      sentenceCleanRegex: '\\(.*?\\)',
+      sentenceCleanRegexEnabled: true,
+      altSentenceCleanRegex: '\\(.*?\\)',
+      altSentenceCleanRegexEnabled: true,
+    },
     media: {
       audioOffsetStart: 0.25,
       audioOffsetEnd: 0.25,
@@ -235,13 +243,35 @@
   function titleFromMediaPath(mediaPath: string): string {
     const filename = mediaPath.replace(/\\/g, '/').split('/').pop() ?? mediaPath
     let title = filename.replace(/\.[^.]+$/, '')
-    // Remove leading [group] fansub tag e.g. "[ASW] "
-    title = title.replace(/^\[[^\]]*\]\s*/, '')
-    // Remove trailing [tag] blocks e.g. "[1080p HEVC][C88519A4]"
-    title = title.replace(/(\s*\[[^\]]*\])+$/, '')
-    // Remove trailing episode number e.g. " - 01" or " - 001"
-    title = title.replace(/\s*-\s*\d{1,3}\s*$/, '')
+    const { mediaFilenameRegex, mediaFilenameRegexEnabled } = settings.value.display
+    if (mediaFilenameRegexEnabled && mediaFilenameRegex) {
+      try {
+        title = title.replace(new RegExp(mediaFilenameRegex, 'g'), '').trim()
+      } catch {
+        // invalid regex — use raw title
+      }
+    }
     return title.trim()
+  }
+
+  function cleanSentence(text: string): string {
+    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
+    if (!sentenceCleanRegexEnabled || !sentenceCleanRegex) return text
+    try {
+      return text.replace(new RegExp(sentenceCleanRegex, 'gm'), '').trim()
+    } catch {
+      return text
+    }
+  }
+
+  function cleanAltSentence(text: string): string {
+    const { altSentenceCleanRegex, altSentenceCleanRegexEnabled } = settings.value.display
+    if (!altSentenceCleanRegexEnabled || !altSentenceCleanRegex) return text
+    try {
+      return text.replace(new RegExp(altSentenceCleanRegex, 'gm'), '').trim()
+    } catch {
+      return text
+    }
   }
 
   watch(
@@ -721,7 +751,7 @@
       const fieldUpdates: Record<string, string> = {}
 
       if (sentenceField) {
-        const text = selectedMsgs.map((m) => m.subtitle).join(' ')
+        const text = selectedMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
         const existingSentence = targetNote.fields[sentenceField]?.value ?? ''
         fieldUpdates[sentenceField] = preserveHtmlTags(existingSentence, text)
       }
@@ -765,7 +795,7 @@
 
       if (secondarySubField) {
         const secondaryText = selectedMsgs
-          .map((m) => m.secondary_subtitle)
+          .map((m) => m.secondary_subtitle ? cleanAltSentence(m.secondary_subtitle) : '')
           .filter(Boolean)
           .join(' ')
         if (secondaryText) {
@@ -974,12 +1004,12 @@
           :class="{ selected: isSelected(message.uid) }"
           @click="toggleSelection(message, index)"
         >
-          <span class="subtitle-text" :style="{ fontSize: settings.display.subtitleFontSize + '%' }">{{ message.subtitle }}</span>
+          <span class="subtitle-text" :style="{ fontSize: settings.display.subtitleFontSize + '%' }">{{ cleanSentence(message.subtitle) }}</span>
           <span
             v-if="message.showSecondary && message.secondary_subtitle"
             class="secondary-sub-text"
             :style="{ fontSize: (settings.display.subtitleFontSize * 0.85) + '%' }"
-          >{{ message.secondary_subtitle }}</span>
+          >{{ cleanAltSentence(message.secondary_subtitle) }}</span>
           <div class="actions">
             <div class="thumb-action">
               <button
@@ -1326,6 +1356,74 @@
                     <span>70%</span>
                     <span>200%</span>
                   </div>
+                </label>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Text processing</h3>
+              </div>
+              <div class="form-grid">
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.sentenceCleanRegexEnabled"
+                        @change="(e) => localDisplay.sentenceCleanRegexEnabled = (e.target as HTMLInputElement).checked"
+                      />
+                    </label>
+                    Sentence clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.sentenceCleanRegex"
+                    :disabled="!localDisplay.sentenceCleanRegexEnabled"
+                    placeholder="e.g. ^\w[\w ]+:\s+ to strip speaker names"
+                    @input="(e) => localDisplay.sentenceCleanRegex = (e.target as HTMLInputElement).value"
+                  />
+                  <small class="field-hint">Applied to subtitle text. Matches are stripped. Affects display and Anki export.</small>
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.altSentenceCleanRegexEnabled"
+                        @change="(e) => localDisplay.altSentenceCleanRegexEnabled = (e.target as HTMLInputElement).checked"
+                      />
+                    </label>
+                    Alt sentence clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.altSentenceCleanRegex"
+                    :disabled="!localDisplay.altSentenceCleanRegexEnabled"
+                    placeholder="e.g. \(.*?\) to strip parenthetical text"
+                    @input="(e) => localDisplay.altSentenceCleanRegex = (e.target as HTMLInputElement).value"
+                  />
+                  <small class="field-hint">Applied to alt (secondary) subtitle text. Matches are stripped. Affects display and Anki export.</small>
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.mediaFilenameRegexEnabled"
+                        @change="(e) => localDisplay.mediaFilenameRegexEnabled = (e.target as HTMLInputElement).checked"
+                      />
+                    </label>
+                    Filename clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.mediaFilenameRegex"
+                    :disabled="!localDisplay.mediaFilenameRegexEnabled"
+                    placeholder="Leave empty to use the full filename"
+                    @input="(e) => localDisplay.mediaFilenameRegex = (e.target as HTMLInputElement).value"
+                  />
+                  <small class="field-hint">Applied globally to the filename (extension removed) to derive the page title. Matches are stripped.</small>
                 </label>
               </div>
             </section>
@@ -1940,9 +2038,31 @@
     border-radius: 6px;
   }
 
+  .form-group input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .field-hint {
     color: #7e8898;
     font-size: 0.85em;
+  }
+
+  .label-with-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.85em;
+    color: #7e8898;
+    font-weight: normal;
+    cursor: pointer;
+    user-select: none;
   }
 
   .muted-box {
