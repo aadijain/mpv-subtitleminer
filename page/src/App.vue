@@ -221,6 +221,11 @@
   const hoveredThumbnailUid = ref<string | null>(null)
   const loadingMedia = ref<Record<string, boolean>>({})
   const selectedMessages = ref<Set<string>>(new Set())
+
+  function clearMessages() {
+    messages.value = []
+    selectedMessages.value = new Set()
+  }
   const currentAudio = ref<HTMLAudioElement | null>(null)
   const pendingAudioRange = ref<{
     startId: number
@@ -895,6 +900,7 @@
       <div class="controls">
         <button class="btn" type="button" @click="ws.connect">Connect</button>
         <button class="btn ghost" type="button" @click="ws.disconnect">Disconnect</button>
+        <button class="btn ghost" type="button" @click="clearMessages">Clear</button>
         <button class="btn ghost" type="button" @click="showSettings = true">⚙ Settings</button>
       </div>
     </header>
