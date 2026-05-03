@@ -5,7 +5,7 @@
   import { useWebSocket } from './composables/useWebSocket'
   import * as anki from './services/ankiConnect'
   import { isJsonObject, type JsonObject, type JsonValue } from './types/json'
-  import type { AnkiSettings, ConnectionSettings, MediaSettings, Settings } from './types/settings'
+  import type { AnkiSettings, ConnectionSettings, DisplaySettings, MediaSettings, Settings } from './types/settings'
   import { preserveHtmlTags } from './utils/htmlUtils'
 
   const DEFAULT_PORTS = [61777, 61778, 61779, 61780, 61781]
@@ -16,6 +16,7 @@
   const defaultSettings: Settings = {
     anki: { noteType: '', frontField: '', sentenceField: '', audioField: '', imageField: '', maxCardAgeMinutes: 5 },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
+    display: { subtitleFontSize: 110 },
     media: {
       audioOffsetStart: 0.25,
       audioOffsetEnd: 0.25,
@@ -45,6 +46,7 @@
           ...parsed,
           anki: { ...defaultSettings.anki, ...parsed.anki },
           connection: { ...defaultSettings.connection, ...parsed.connection },
+          display: { ...defaultSettings.display, ...(parsed.display ?? {}) },
           media: { ...defaultSettings.media, ...parsed.media },
         }
       }
@@ -84,6 +86,7 @@
   const localSettings = ref<AnkiSettings>({ ...settings.value.anki })
   const localConnection = ref<ConnectionSettings>({ ...settings.value.connection })
   const localMedia = ref<MediaSettings>({ ...settings.value.media })
+  const localDisplay = ref<DisplaySettings>({ ...settings.value.display })
   const localPortInput = ref('')
 
   const modelNames = computed(() => Object.keys(modelsWithFields.value).sort())
@@ -103,6 +106,7 @@
       localSettings.value = { ...settings.value.anki }
       localConnection.value = { ...settings.value.connection }
       localMedia.value = { ...settings.value.media }
+      localDisplay.value = { ...settings.value.display }
       localPortInput.value = localConnection.value.ports.join(', ')
       if (connectionStatus.value === 'untested') {
         void testConnection()
@@ -183,7 +187,8 @@
     settings.value.anki = { ...localSettings.value }
     settings.value.connection = { ...localConnection.value }
     settings.value.media = { ...localMedia.value }
-    
+    settings.value.display = { ...localDisplay.value }
+
     if (mediaSettingsChanged) {
       for (const msg of messages.value) {
         msg.audio = undefined
@@ -904,7 +909,7 @@
           :class="{ selected: isSelected(message.uid) }"
           @click="toggleSelection(message, index)"
         >
-          <span class="subtitle-text">{{ message.subtitle }}</span>
+          <span class="subtitle-text" :style="{ fontSize: settings.display.subtitleFontSize + '%' }">{{ message.subtitle }}</span>
           <div class="actions">
             <div class="thumb-action">
               <button
@@ -1193,6 +1198,30 @@
                 </template>
                 <div v-if="loadingModels" class="muted-box">Loading note types…</div>
                 <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Display</h3>
+              </div>
+              <div class="form-grid">
+                <label class="form-group">
+                  <span>Subtitle font size ({{ localDisplay.subtitleFontSize }}%)</span>
+                  <input
+                    type="range"
+                    min="70"
+                    max="200"
+                    step="5"
+                    :value="localDisplay.subtitleFontSize"
+                    class="range-input"
+                    @input="(e) => localDisplay.subtitleFontSize = parseInt((e.target as HTMLInputElement).value)"
+                  />
+                  <div class="range-labels">
+                    <span>70%</span>
+                    <span>200%</span>
+                  </div>
+                </label>
               </div>
             </section>
 
@@ -1909,5 +1938,48 @@
     display: block;
     margin-top: 0.5rem;
     text-align: left;
+  }
+
+  .range-input {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: #2a303a;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .range-input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #5a9aca;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .range-input::-webkit-slider-thumb:hover {
+    background: #7bb3d9;
+  }
+
+  .range-input::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #5a9aca;
+    cursor: pointer;
+    border: none;
+  }
+
+  .range-labels {
+    display: flex;
+    justify-content: space-between;
+    color: #7e8898;
+    font-size: 0.8em;
+    margin-top: 2px;
   }
 </style>
