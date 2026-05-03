@@ -71,6 +71,8 @@ Grab the matching `.zip` from the GitHub Releases page:
 mpv/
 ├── scripts/
 │   └── mpv-subtitleminer.lua
+├── script-opts/
+│   └── mpv-subtitleminer.conf
 ├── mpv.conf
 ├── mpv-subtitleminer.exe
 ├── ffmpeg.exe (optional; if you don't have ffmpeg in PATH)
