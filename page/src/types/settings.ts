@@ -22,6 +22,7 @@ export interface AnkiSettings {
   sentenceField: string
   audioField: string
   imageField: string
+  secondarySubField: string
   maxCardAgeMinutes: number
 }
 

@@ -15,6 +15,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Stream subtitles to web front end and interactively look up words.
 - Anki integration via AnkiConnect: Select your note type, make a card and add media.
 - Replay sentences with audio anytime.
+- *(fork)* Secondary subtitle support: supports streaming mpv's secondary subtitles to the web front end. (secondary subs are automatically matched to the corresponding primary subs)
 - *(fork)* Adjustable font size.
 - *(fork)* Clear screen button.
 - *(fork)* Page title updates based on currently playing media file name.
@@ -59,7 +60,7 @@ Grab the matching `.zip` from the GitHub Releases page:
 
 - The server starts automatically with mpv, simply open a video with subtitles.
 - Open `index.html` in your browser. It should automatically connect to the running mpv instance.
-- Press `Ctrl+a` to toggle/restart the server.
+- Press `Ctrl+a` to toggle/restart the server at any time.
 
 ## Troubleshooting
 
@@ -80,4 +81,6 @@ mpv/
 
 ```
 
-4. Open mpv from the command line to see error messages. Press Ctrl+a to restart the server and check for errors.
+4. To change settings (ports, auto-start, secondary subtitle matching tolerance), edit `script-opts/mpv-subtitleminer.conf`.
+
+5. Open mpv from the command line to see error messages. Press Ctrl+a to restart the server and check for errors.
