@@ -27,10 +27,12 @@ pub enum SubtitleEvent {
     New(Subtitle),
     SecondaryUpdate { id: u64, text: String },
     SecondaryAppend { id: u64, text: String },
+    MediaChanged(String),
 }
 
 struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
+    current_media_path: RwLock<Option<String>>,
 }
 
 /// Drops subtitle lines based on their ASS Dialogue metadata fields.
@@ -146,6 +148,7 @@ impl SharedState {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
+            current_media_path: RwLock::new(None),
         })
     }
 }
@@ -155,22 +158,22 @@ impl SharedState {
 struct PendingPrimary {
     id: u64,
     text: String,
-    // indices: 0=sub_start, 1=sub_end, 2=path, 3=aid, 4=sub_delay, 5=sub-text/ass-full (optional)
-    responses: [Option<serde_json::Value>; 6],
+    // indices: 0=sub_start, 1=sub_end, 2=aid, 3=sub_delay, 4=sub-text/ass-full (optional)
+    responses: [Option<serde_json::Value>; 5],
 }
 
 impl PendingPrimary {
     fn new(id: u64, text: String, query_ass_full: bool) -> Self {
-        let mut responses: [Option<serde_json::Value>; 6] = Default::default();
+        let mut responses: [Option<serde_json::Value>; 5] = Default::default();
         if !query_ass_full {
             // Pre-fill the ass-full slot so is_ready() doesn't wait for a query we never sent.
-            responses[5] = Some(serde_json::Value::Null);
+            responses[4] = Some(serde_json::Value::Null);
         }
         Self { id, text, responses }
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 6 {
+        if index < 5 {
             self.responses[index] = Some(value);
         }
     }
@@ -182,11 +185,11 @@ impl PendingPrimary {
     /// The raw `sub-text/ass-full` Dialogue line, if mpv returned a string for it.
     /// Returns None when the query was skipped or mpv returned an error/non-string.
     fn ass_full(&self) -> Option<&str> {
-        self.responses[5].as_ref().and_then(|v| v.as_str())
+        self.responses[4].as_ref().and_then(|v| v.as_str())
     }
 
     fn sub_delay(&self) -> f64 {
-        self.responses[4].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
+        self.responses[3].as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0)
     }
 
     fn sub_start(&self) -> Option<f64> {
@@ -197,7 +200,7 @@ impl PendingPrimary {
         Some(self.responses[1].as_ref()?.as_f64()? + self.sub_delay())
     }
 
-    fn into_subtitle(self, secondary_text: Option<String>) -> Subtitle {
+    fn into_subtitle(self, secondary_text: Option<String>, media_path: String) -> Subtitle {
         let delay = self.sub_delay();
         Subtitle {
             id: self.id,
@@ -205,8 +208,8 @@ impl PendingPrimary {
             secondary_text,
             sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
             sub_end:   self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
-            media_path: self.responses[2].as_ref().unwrap().as_str().unwrap().to_string(),
-            aid: self.responses[3].as_ref().unwrap().as_i64().unwrap(),
+            media_path,
+            aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
         }
     }
 }
@@ -423,10 +426,13 @@ async fn handle_mpv(
 ) -> std::io::Result<()> {
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
-          {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n",
+          {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n\
+          {\"command\":[\"observe_property\",3,\"path\"]}\n",
     )
     .await?;
     info!("Connected to mpv, observing subtitle changes");
+
+    let mut current_path: Option<String> = None;
 
     // Pending primaries/secondaries keyed by base request_id.
     let mut pending_primary: HashMap<u64, PendingPrimary> = HashMap::new();
@@ -472,8 +478,7 @@ async fn handle_mpv(
                         // IPC error — sentinel so is_ready() can fire and we can discard.
                         let fallback: serde_json::Value = match prop_idx {
                             0 | 1 => f64::MAX.into(),
-                            2 => "".into(),
-                            3 => (-1i64).into(),
+                            2 => (-1i64).into(),
                             _ => 0.0f64.into(),
                         };
                         p.set_response(prop_idx, fallback);
@@ -502,7 +507,7 @@ async fn handle_mpv(
                     }
 
                     // Emit immediately — secondary arrives via SecondaryUpdate.
-                    emit(primary, None, &state, &tx).await;
+                    emit(primary, None, current_path.clone().unwrap_or_default(), &state, &tx).await;
 
                     // Did a secondary land just before this primary's batch finished?
                     let claimed_orphan = orphan_secondary
@@ -652,6 +657,19 @@ async fn handle_mpv(
 
         let observer_id = json.get("id").and_then(|v| v.as_u64());
 
+        // ── Media file path changed ───────────────────────────────────────────
+        if observer_id == Some(3) {
+            if let Some(path) = json.get("data").and_then(|d| d.as_str()) {
+                let path = path.to_string();
+                if current_path.as_deref() != Some(&path) {
+                    current_path = Some(path.clone());
+                    *state.current_media_path.write().await = Some(path.clone());
+                    let _ = tx.send(SubtitleEvent::MediaChanged(path));
+                }
+            }
+            continue;
+        }
+
         // ── Secondary subtitle text changed ───────────────────────────────────
         if observer_id == Some(2) {
             let text = match json
@@ -704,21 +722,19 @@ async fn handle_mpv(
                     concat!(
                         "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
                         "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
-                        "{{\"command\":[\"get_property\",\"path\"],\"request_id\":{2}}}\n",
-                        "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{3}}}\n",
-                        "{{\"command\":[\"get_property\",\"sub-delay\"],\"request_id\":{4}}}\n"
+                        "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n",
+                        "{{\"command\":[\"get_property\",\"sub-delay\"],\"request_id\":{3}}}\n"
                     ),
                     base_id,
                     base_id + 1,
                     base_id + 2,
                     base_id + 3,
-                    base_id + 4
                 );
                 let query_ass_full = primary_filter.is_active();
                 if query_ass_full {
                     cmd.push_str(&format!(
                         "{{\"command\":[\"get_property\",\"sub-text/ass-full\"],\"request_id\":{}}}\n",
-                        base_id + 5
+                        base_id + 4
                     ));
                 }
 
@@ -736,10 +752,11 @@ async fn handle_mpv(
 async fn emit(
     primary: PendingPrimary,
     secondary_text: Option<String>,
+    media_path: String,
     state: &Arc<SharedState>,
     tx: &broadcast::Sender<SubtitleEvent>,
 ) {
-    let sub = primary.into_subtitle(secondary_text);
+    let sub = primary.into_subtitle(secondary_text, media_path);
     debug!("[sub:{}] Broadcasting (secondary: {:?})", sub.id, sub.secondary_text.is_some());
     state.subtitles.write().await.insert(sub.id, sub.clone());
     let _ = tx.send(SubtitleEvent::New(sub));
@@ -754,6 +771,11 @@ async fn handle_client(
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
+    if let Some(path) = state.current_media_path.read().await.clone() {
+        let msg = serde_json::json!({"type": "media_changed", "path": path});
+        ws_tx.send(Message::Text(msg.to_string().into())).await?;
+    }
+
     loop {
         tokio::select! {
             Ok(event) = subtitle_rx.recv() => {
@@ -765,7 +787,6 @@ async fn handle_client(
                         "secondary_subtitle": sub.secondary_text,
                         "sub_start": sub.sub_start,
                         "sub_end": sub.sub_end,
-                        "media_path": sub.media_path,
                     }),
                     SubtitleEvent::SecondaryUpdate { id, text } => serde_json::json!({
                         "type": "secondary_update",
@@ -776,6 +797,10 @@ async fn handle_client(
                         "type": "secondary_append",
                         "id": id,
                         "secondary_subtitle": text,
+                    }),
+                    SubtitleEvent::MediaChanged(path) => serde_json::json!({
+                        "type": "media_changed",
+                        "path": path,
                     }),
                 };
                 ws_tx.send(Message::Text(msg.to_string().into())).await?;
