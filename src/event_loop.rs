@@ -11,6 +11,33 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use crate::media::FfmpegRequest;
 use crate::mpv_stream::MpvStream;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleTrack {
+    Primary,
+    Secondary,
+}
+
+impl SubtitleTrack {
+    fn as_str(self) -> &'static str {
+        match self {
+            SubtitleTrack::Primary => "primary",
+            SubtitleTrack::Secondary => "secondary",
+        }
+    }
+
+    /// (start, end, delay) mpv property names for this track.
+    fn properties(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            SubtitleTrack::Primary => ("sub-start", "sub-end", "sub-delay"),
+            SubtitleTrack::Secondary => (
+                "secondary-sub-start",
+                "secondary-sub-end",
+                "secondary-sub-delay",
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Subtitle {
     pub id: u64,
@@ -19,6 +46,7 @@ pub struct Subtitle {
     pub sub_end: f64,
     pub media_path: String,
     pub aid: i64,
+    pub track: SubtitleTrack,
 }
 
 #[derive(Clone)]
@@ -44,14 +72,16 @@ impl SharedState {
 struct PendingSubtitle {
     id: u64,
     text: String,
+    track: SubtitleTrack,
     responses: [Option<serde_json::Value>; 4], // sub_start, sub_end, aid, sub_delay
 }
 
 impl PendingSubtitle {
-    fn new(id: u64, text: String) -> Self {
+    fn new(id: u64, text: String, track: SubtitleTrack) -> Self {
         Self {
             id,
             text,
+            track,
             responses: Default::default(),
         }
     }
@@ -82,6 +112,7 @@ impl PendingSubtitle {
             sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
             media_path,
             aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
+            track: self.track,
         }
     }
 }
@@ -229,6 +260,7 @@ async fn handle_mpv(
 ) -> std::io::Result<()> {
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
+          {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n\
           {\"command\":[\"observe_property\",3,\"path\"]}\n",
     )
     .await?;
@@ -271,7 +303,7 @@ async fn handle_mpv(
             for base_id in completed {
                 let media_path = current_path.clone().unwrap_or_default();
                 let sub = pending.remove(&base_id).unwrap().into_subtitle(media_path);
-                debug!("[sub:{}] Broadcasting", sub.id);
+                debug!("[{}:{}] Broadcasting", sub.track.as_str(), sub.id);
                 state.subtitles.write().await.insert(sub.id, sub.clone());
                 let _ = tx.send(SubtitleEvent::New(sub));
             }
@@ -282,8 +314,10 @@ async fn handle_mpv(
             continue;
         }
 
+        let observer_id = json.get("id").and_then(|v| v.as_u64());
+
         // Media file path changed (observer id 3)
-        if json.get("id").and_then(|v| v.as_u64()) == Some(3) {
+        if observer_id == Some(3) {
             if let Some(path) = json.get("data").and_then(|d| d.as_str()) {
                 let path = path.to_string();
                 if current_path.as_deref() != Some(&path) {
@@ -295,7 +329,13 @@ async fn handle_mpv(
             continue;
         }
 
-        // Handle subtitle property changes (observer id 1)
+        // Subtitle text changed: primary (observer id 1) or secondary (observer id 2).
+        let track = match observer_id {
+            Some(1) => SubtitleTrack::Primary,
+            Some(2) => SubtitleTrack::Secondary,
+            _ => continue,
+        };
+
         if let Some(text) = json
             .get("data")
             .and_then(|d| d.as_str())
@@ -307,23 +347,30 @@ async fn handle_mpv(
             let base_id = next_request_id;
             next_request_id += 10;
 
-            // Query all properties we need
+            // Query all properties we need (per-track start/end/delay; shared aid)
+            let (start_prop, end_prop, delay_prop) = track.properties();
             let cmd = format!(
                 concat!(
-                    "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
-                    "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n",
-                    "{{\"command\":[\"get_property\",\"sub-delay\"],\"request_id\":{3}}}\n"
+                    "{{\"command\":[\"get_property\",\"{0}\"],\"request_id\":{1}}}\n",
+                    "{{\"command\":[\"get_property\",\"{2}\"],\"request_id\":{3}}}\n",
+                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{4}}}\n",
+                    "{{\"command\":[\"get_property\",\"{5}\"],\"request_id\":{6}}}\n"
                 ),
+                start_prop,
                 base_id,
+                end_prop,
                 base_id + 1,
                 base_id + 2,
+                delay_prop,
                 base_id + 3
             );
 
             mpv.write_all(cmd.as_bytes()).await?;
-            pending.insert(base_id, PendingSubtitle::new(subtitle_id, text.to_string()));
-            info!("[sub:{}] {}", subtitle_id, text);
+            pending.insert(
+                base_id,
+                PendingSubtitle::new(subtitle_id, text.to_string(), track),
+            );
+            info!("[{}:{}] {}", track.as_str(), subtitle_id, text);
         }
     }
 }
@@ -352,6 +399,7 @@ async fn handle_client(
                         "subtitle": sub.text,
                         "sub_start": sub.sub_start,
                         "sub_end": sub.sub_end,
+                        "track": sub.track.as_str(),
                     }),
                     SubtitleEvent::MediaChanged(path) => serde_json::json!({
                         "type": "media_changed",
