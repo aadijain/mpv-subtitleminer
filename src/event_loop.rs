@@ -44,7 +44,7 @@ impl SharedState {
 struct PendingSubtitle {
     id: u64,
     text: String,
-    responses: [Option<serde_json::Value>; 3], // sub_start, sub_end, aid
+    responses: [Option<serde_json::Value>; 4], // sub_start, sub_end, aid, sub_delay
 }
 
 impl PendingSubtitle {
@@ -57,7 +57,7 @@ impl PendingSubtitle {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 3 {
+        if index < 4 {
             self.responses[index] = Some(value);
         }
     }
@@ -66,12 +66,20 @@ impl PendingSubtitle {
         self.responses.iter().all(|r| r.is_some())
     }
 
+    fn sub_delay(&self) -> f64 {
+        self.responses[3]
+            .as_ref()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+    }
+
     fn into_subtitle(self, media_path: String) -> Subtitle {
+        let delay = self.sub_delay();
         Subtitle {
             id: self.id,
             text: self.text,
-            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap(),
-            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap(),
+            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
+            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
             media_path,
             aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
         }
@@ -304,11 +312,13 @@ async fn handle_mpv(
                 concat!(
                     "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
                     "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n"
+                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n",
+                    "{{\"command\":[\"get_property\",\"sub-delay\"],\"request_id\":{3}}}\n"
                 ),
                 base_id,
                 base_id + 1,
-                base_id + 2
+                base_id + 2,
+                base_id + 3
             );
 
             mpv.write_all(cmd.as_bytes()).await?;
