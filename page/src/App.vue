@@ -32,6 +32,7 @@
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
       subtitleFontSize: 110,
+      secondaryFontSize: 95,
       mediaFilenameRegex: '^\\[.*?\\]\\s*|\\s*S\\d+E\\d+.*$',
       mediaFilenameRegexEnabled: true,
       sentenceCleanRegex: '\\(.*?\\)',
@@ -1213,7 +1214,9 @@
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
-              <span class="tl-text">{{ cleanSecondary(message.subtitle) }}</span>
+              <span class="tl-text" :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
+                >{{ cleanSecondary(message.subtitle) }}</span
+              >
             </div>
           </div>
         </div>
@@ -1468,7 +1471,7 @@
               </div>
               <div class="form-grid">
                 <label class="form-group">
-                  <span>Subtitle font size ({{ localDisplay.subtitleFontSize }}%)</span>
+                  <span>Primary font size ({{ localDisplay.subtitleFontSize }}%)</span>
                   <input
                     type="range"
                     min="70"
@@ -1479,6 +1482,27 @@
                     @input="
                       (e) =>
                         (localDisplay.subtitleFontSize = parseInt(
+                          (e.target as HTMLInputElement).value,
+                        ))
+                    "
+                  />
+                  <div class="range-labels">
+                    <span>70%</span>
+                    <span>200%</span>
+                  </div>
+                </label>
+                <label class="form-group">
+                  <span>Secondary font size ({{ localDisplay.secondaryFontSize }}%)</span>
+                  <input
+                    type="range"
+                    min="70"
+                    max="200"
+                    step="5"
+                    :value="localDisplay.secondaryFontSize"
+                    class="range-input"
+                    @input="
+                      (e) =>
+                        (localDisplay.secondaryFontSize = parseInt(
                           (e.target as HTMLInputElement).value,
                         ))
                     "
@@ -2004,7 +2028,6 @@
   }
 
   .tl-block.secondary .tl-text {
-    font-size: 0.95em;
     color: #c5cedd;
   }
 

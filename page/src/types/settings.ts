@@ -33,6 +33,7 @@ export interface ConnectionSettings {
 
 export interface DisplaySettings {
   subtitleFontSize: number
+  secondaryFontSize: number
   mediaFilenameRegex: string
   mediaFilenameRegexEnabled: boolean
   sentenceCleanRegex: string
