@@ -32,6 +32,8 @@ export interface ConnectionSettings {
 
 export interface DisplaySettings {
   subtitleFontSize: number
+  sentenceCleanRegex: string
+  sentenceCleanRegexEnabled: boolean
 }
 
 export interface Settings {
