@@ -380,7 +380,7 @@
 
   const blockStyle = (m: SubtitleMessage) => {
     const top = yFor(m.sub_start)
-    return { top: `${top}px`, height: `${Math.max(40, yFor(m.sub_end) - top)}px` }
+    return { top: `${top}px`, '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px` }
   }
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
 
@@ -1179,7 +1179,11 @@
 
     <main ref="mainRef" class="main">
       <div v-if="messages.length === 0" class="empty">Waiting for subtitles...</div>
-      <div v-else class="timeline" :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }">
+      <div
+        v-else
+        class="timeline"
+        :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }"
+      >
         <div class="tl-head">
           <div class="tl-head-gutter">time</div>
           <div class="tl-head-col primary">
@@ -1323,7 +1327,9 @@
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
-              <span class="tl-text" :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
+              <span
+                class="tl-text"
+                :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
                 >{{ cleanSecondary(message.subtitle) }}</span
               >
             </div>
@@ -2169,6 +2175,8 @@
     position: absolute;
     left: 8px;
     right: 8px;
+    /* time-proportional height as a variable so :hover can override it to fit the text */
+    height: var(--tl-h);
     display: flex;
     align-items: flex-start;
     gap: 6px;
@@ -2181,10 +2189,6 @@
     transition:
       background 0.15s ease,
       border-color 0.15s ease;
-  }
-
-  .tl-block:hover {
-    background: #20262f;
   }
 
   .tl-block.sel {
@@ -2209,6 +2213,18 @@
 
   .tl-block.secondary.sel::before {
     background: #3ddc97;
+  }
+
+  /* On hover the block grows to show its full text (and overlays neighbours below). Placed
+     after the .sel rules so the opaque background wins; selection stays shown via the border
+     and the left accent bar. */
+  .tl-block:hover {
+    height: auto;
+    min-height: var(--tl-h);
+    overflow: visible;
+    z-index: 5;
+    background: #20262f;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
   }
 
   .tl-text {
