@@ -5,7 +5,13 @@
   import { useWebSocket } from './composables/useWebSocket'
   import * as anki from './services/ankiConnect'
   import { isJsonObject, type JsonObject, type JsonValue } from './types/json'
-  import type { AnkiSettings, ConnectionSettings, DisplaySettings, MediaSettings, Settings } from './types/settings'
+  import type {
+    AnkiSettings,
+    ConnectionSettings,
+    DisplaySettings,
+    MediaSettings,
+    Settings,
+  } from './types/settings'
   import { preserveHtmlTags } from './utils/htmlUtils'
 
   const DEFAULT_PORTS = [61777, 61778, 61779, 61780, 61781]
@@ -14,10 +20,19 @@
 
   const STORAGE_KEY = 'mpv_subtitle_tool_settings'
   const defaultSettings: Settings = {
-    anki: { noteType: '', frontField: '', sentenceField: '', audioField: '', imageField: '', maxCardAgeMinutes: 5 },
+    anki: {
+      noteType: '',
+      frontField: '',
+      sentenceField: '',
+      audioField: '',
+      imageField: '',
+      maxCardAgeMinutes: 5,
+    },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
       subtitleFontSize: 110,
+      mediaFilenameRegex: '^\\[.*?\\]\\s*|\\s*S\\d+E\\d+.*$',
+      mediaFilenameRegexEnabled: true,
       sentenceCleanRegex: '\\(.*?\\)',
       sentenceCleanRegexEnabled: true,
     },
@@ -229,6 +244,21 @@
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+    document.title = 'Subtitle Tool Page'
+  }
+
+  function titleFromMediaPath(mediaPath: string): string {
+    const filename = mediaPath.replace(/\\/g, '/').split('/').pop() ?? mediaPath
+    let title = filename.replace(/\.[^.]+$/, '')
+    const { mediaFilenameRegex, mediaFilenameRegexEnabled } = settings.value.display
+    if (mediaFilenameRegexEnabled && mediaFilenameRegex) {
+      try {
+        title = title.replace(new RegExp(mediaFilenameRegex, 'g'), '').trim()
+      } catch {
+        // invalid regex — use raw title
+      }
+    }
+    return title.trim()
   }
 
   function cleanSentence(text: string): string {
@@ -285,6 +315,12 @@
       const type = data.type
       if (typeof type !== 'string') return
       const d = data
+
+      if (type === 'media_changed') {
+        const path = asString(d.path)
+        document.title = path ? titleFromMediaPath(path) : 'Subtitle Tool Page'
+        return
+      }
 
       if (type === 'subtitle') {
         const msg = parseSubtitleMessage(d, port)
@@ -529,9 +565,7 @@
         format: media.audioAdvanced ? media.audioAdvancedExtension : media.audioFormat,
         quality: media.audioQuality,
         filters: media.audioFilters,
-        advanced_args: media.audioAdvanced
-          ? media.audioAdvancedArgs
-          : null,
+        advanced_args: media.audioAdvanced ? media.audioAdvancedArgs : null,
       },
     }
   }
@@ -544,9 +578,7 @@
         quality: media.imageQuality,
         is_animated: media.imageAnimated,
         size: media.imageSize,
-        advanced_args: media.imageAdvanced
-          ? media.imageAdvancedArgs
-          : null,
+        advanced_args: media.imageAdvanced ? media.imageAdvancedArgs : null,
       },
     }
   }
@@ -680,7 +712,9 @@
         const thresholdMs = maxAgeMinutes * 60000
 
         if (Date.now() - targetNote.noteId > thresholdMs) {
-          throw new Error(`Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`)
+          throw new Error(
+            `Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`,
+          )
         }
       }
 
@@ -703,7 +737,7 @@
         let audioData =
           selectedMsgs.length > 1
             ? await requestAudioRange(first.id, last.id, first.sourcePort)
-                : first.audio || (await requestMediaFromServer(first, 'audio'))
+            : first.audio || (await requestMediaFromServer(first, 'audio'))
 
         if (audioData) {
           const filename = generateMediaFilename(primaryId, 'audio')
@@ -713,13 +747,13 @@
       }
 
       if (imageField) {
-        let imageData = (selectedMsgs.length === 1) ? first.thumbnail : undefined
+        let imageData = selectedMsgs.length === 1 ? first.thumbnail : undefined
 
         if (!imageData) {
           imageData = await requestMediaFromServer(
-            first, 
-            'thumbnail', 
-            selectedMsgs.length > 1 ? last.id : undefined
+            first,
+            'thumbnail',
+            selectedMsgs.length > 1 ? last.id : undefined,
           )
         }
         if (imageData) {
@@ -796,7 +830,7 @@
         ...(endId ? { end_id: endId } : {}),
         ...(type === 'thumbnail' ? getImageParams() : getAudioParams()),
       }
-      
+
       if (!sendToPort(payload, msg.sourcePort)) {
         delete loadingMedia.value[key]
         resolve(undefined)
@@ -929,7 +963,11 @@
           :class="{ selected: isSelected(message.uid) }"
           @click="toggleSelection(message, index)"
         >
-          <span class="subtitle-text" :style="{ fontSize: settings.display.subtitleFontSize + '%' }">{{ cleanSentence(message.subtitle) }}</span>
+          <span
+            class="subtitle-text"
+            :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
+            >{{ cleanSentence(message.subtitle) }}</span
+          >
           <div class="actions">
             <div class="thumb-action">
               <button
@@ -967,7 +1005,10 @@
                 v-if="hoveredThumbnailUid === message.uid && message.thumbnail"
                 class="thumb-preview"
               >
-                <img :src="`data:image/${settings.media.imageFormat};base64,${message.thumbnail}`" alt="Thumbnail" />
+                <img
+                  :src="`data:image/${settings.media.imageFormat};base64,${message.thumbnail}`"
+                  alt="Thumbnail"
+                />
               </div>
             </div>
             <button
@@ -1071,11 +1112,7 @@
               <div class="form-grid">
                 <label class="form-group">
                   <span>Host IP</span>
-                  <input
-                    v-model="localConnection.host"
-                    type="text"
-                    placeholder="127.0.0.1"
-                  />
+                  <input v-model="localConnection.host" type="text" placeholder="127.0.0.1" />
                 </label>
                 <label class="form-group">
                   <span>Ports (comma separated)</span>
@@ -1211,9 +1248,17 @@
                       min="0"
                       step="0.1"
                       :value="localSettings.maxCardAgeMinutes"
-                      @input="(e) => onFieldChange('maxCardAgeMinutes', parseFloat((e.target as HTMLInputElement).value) || 0)"
+                      @input="
+                        (e) =>
+                          onFieldChange(
+                            'maxCardAgeMinutes',
+                            parseFloat((e.target as HTMLInputElement).value) || 0,
+                          )
+                      "
                     />
-                    <small class="field-hint">Prevent adding to cards older than this (0 for no limit).</small>
+                    <small class="field-hint"
+                      >Prevent adding to cards older than this (0 for no limit).</small
+                    >
                   </label>
                 </template>
                 <div v-if="loadingModels" class="muted-box">Loading note types…</div>
@@ -1235,7 +1280,12 @@
                     step="5"
                     :value="localDisplay.subtitleFontSize"
                     class="range-input"
-                    @input="(e) => localDisplay.subtitleFontSize = parseInt((e.target as HTMLInputElement).value)"
+                    @input="
+                      (e) =>
+                        (localDisplay.subtitleFontSize = parseInt(
+                          (e.target as HTMLInputElement).value,
+                        ))
+                    "
                   />
                   <div class="range-labels">
                     <span>70%</span>
@@ -1256,7 +1306,12 @@
                       <input
                         type="checkbox"
                         :checked="localDisplay.sentenceCleanRegexEnabled"
-                        @change="(e) => localDisplay.sentenceCleanRegexEnabled = (e.target as HTMLInputElement).checked"
+                        @change="
+                          (e) =>
+                            (localDisplay.sentenceCleanRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
                       />
                     </label>
                     Sentence clean regex
@@ -1266,9 +1321,46 @@
                     :value="localDisplay.sentenceCleanRegex"
                     :disabled="!localDisplay.sentenceCleanRegexEnabled"
                     placeholder="e.g. ^\w[\w ]+:\s+ to strip speaker names"
-                    @input="(e) => localDisplay.sentenceCleanRegex = (e.target as HTMLInputElement).value"
+                    @input="
+                      (e) =>
+                        (localDisplay.sentenceCleanRegex = (e.target as HTMLInputElement).value)
+                    "
                   />
-                  <small class="field-hint">Applied to subtitle text. Matches are stripped. Affects display and Anki export.</small>
+                  <small class="field-hint"
+                    >Applied to subtitle text. Matches are stripped. Affects display and Anki
+                    export.</small
+                  >
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.mediaFilenameRegexEnabled"
+                        @change="
+                          (e) =>
+                            (localDisplay.mediaFilenameRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
+                      />
+                    </label>
+                    Filename clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.mediaFilenameRegex"
+                    :disabled="!localDisplay.mediaFilenameRegexEnabled"
+                    placeholder="Leave empty to use the full filename"
+                    @input="
+                      (e) =>
+                        (localDisplay.mediaFilenameRegex = (e.target as HTMLInputElement).value)
+                    "
+                  />
+                  <small class="field-hint"
+                    >Applied globally to the filename (extension removed) to derive the page title.
+                    Matches are stripped.</small
+                  >
                 </label>
               </div>
             </section>
@@ -1277,10 +1369,7 @@
               <div class="section-header">
                 <h3>Media configuration</h3>
               </div>
-              <MediaConfiguration 
-                v-model="localMedia" 
-                :default-settings="defaultSettings"
-              />
+              <MediaConfiguration v-model="localMedia" :default-settings="defaultSettings" />
             </section>
           </div>
 
@@ -1458,7 +1547,9 @@
     justify-content: center;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s ease, background 0.15s ease;
+    transition:
+      opacity 0.2s ease,
+      background 0.15s ease;
   }
 
   .btn-reset.visible {

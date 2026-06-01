@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - *(fork)* Adjustable font size.
 - *(fork)* Clear screen button.
 - *(fork)* Parse subtitle text before exporting to Anki. (strip speaker names, annotations, etc.)
+- *(fork)* Page title updates based on currently playing media file name.
 
 ## Downloads
 
