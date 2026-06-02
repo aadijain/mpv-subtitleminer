@@ -35,6 +35,72 @@ impl SubtitleTrack {
     }
 }
 
+/// Parses an ASS timestamp `H:MM:SS.cc` (centiseconds) into absolute seconds.
+#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
+fn parse_ass_time(s: &str) -> Option<f64> {
+    let mut parts = s.trim().split(':');
+    let h: f64 = parts.next()?.trim().parse().ok()?;
+    let m: f64 = parts.next()?.trim().parse().ok()?;
+    let sec: f64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// Converts an ASS event Text field to display text: drops `{...}` override
+/// blocks and converts hard breaks (`\N`, `\n`) to newlines and hard spaces
+/// (`\h`) to spaces.
+#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
+fn strip_ass_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_override = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => in_override = true,
+            '}' => in_override = false,
+            _ if in_override => {}
+            '\\' => match chars.peek() {
+                Some('N') | Some('n') => {
+                    out.push('\n');
+                    chars.next();
+                }
+                Some('h') => {
+                    out.push(' ');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Extracts `(start, end, style, name, text)` from a single ASS Dialogue line:
+/// `[Dialogue: ]Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
+/// Times are absolute seconds; `text` is display-cleaned. Returns `None` for any
+/// line that isn't a parseable Dialogue (headers, Comment lines, etc.).
+#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
+fn parse_ass_dialogue(s: &str) -> Option<(f64, f64, &str, &str, String)> {
+    let s = s.strip_prefix("Dialogue: ").unwrap_or(s);
+    let mut parts = s.splitn(10, ',');
+    // Layer is always an integer in a real Dialogue event; this also rejects
+    // Comment lines and headers that happen to share the comma layout.
+    parts.next()?.trim().parse::<i64>().ok()?;
+    let start = parse_ass_time(parts.next()?)?;
+    let end = parse_ass_time(parts.next()?)?;
+    let style = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    parts.next()?; // MarginL
+    parts.next()?; // MarginR
+    parts.next()?; // MarginV
+    parts.next()?; // Effect
+    let text = parts.next()?;
+    Some((start, end, style, name, strip_ass_text(text)))
+}
+
 #[derive(Clone)]
 pub struct Subtitle {
     pub id: u64,
@@ -576,5 +642,63 @@ async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) ->
                 .to_string(),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ass_time_parses_h_mm_ss_cc() {
+        assert_eq!(parse_ass_time("0:00:01.50"), Some(1.5));
+        assert_eq!(parse_ass_time("0:00:00.00"), Some(0.0));
+        assert_eq!(parse_ass_time("1:02:03.00"), Some(3723.0));
+        assert_eq!(parse_ass_time(" 0:00:01.50 "), Some(1.5));
+    }
+
+    #[test]
+    fn ass_time_rejects_malformed() {
+        assert_eq!(parse_ass_time("00:01.50"), None); // missing hours field
+        assert_eq!(parse_ass_time("0:00:01:50"), None); // too many fields
+        assert_eq!(parse_ass_time("a:b:c"), None);
+    }
+
+    #[test]
+    fn strip_ass_text_removes_overrides_and_breaks() {
+        assert_eq!(strip_ass_text("{\\i1}Hello{\\i0}"), "Hello");
+        assert_eq!(strip_ass_text("Line1\\NLine2"), "Line1\nLine2");
+        assert_eq!(strip_ass_text("a\\hb"), "a b");
+        assert_eq!(strip_ass_text("plain"), "plain");
+        // backslash not introducing a known escape is kept verbatim
+        assert_eq!(strip_ass_text("a\\xb"), "a\\xb");
+    }
+
+    #[test]
+    fn parse_dialogue_extracts_fields() {
+        let line = "Dialogue: 0,0:00:01.00,0:00:03.50,Default,Alice,0,0,0,,{\\i1}Hi{\\i0} there";
+        let (start, end, style, name, text) = parse_ass_dialogue(line).unwrap();
+        assert_eq!(start, 1.0);
+        assert_eq!(end, 3.5);
+        assert_eq!(style, "Default");
+        assert_eq!(name, "Alice");
+        assert_eq!(text, "Hi there");
+    }
+
+    #[test]
+    fn parse_dialogue_handles_srt_converted_and_commas_in_text() {
+        // SRT converted by mpv: single Default style, empty Name, plain text.
+        let line = "Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Wait, stop!";
+        let (start, end, style, name, text) = parse_ass_dialogue(line).unwrap();
+        assert_eq!((start, end), (5.0, 7.0));
+        assert_eq!(style, "Default");
+        assert_eq!(name, "");
+        assert_eq!(text, "Wait, stop!"); // comma in the Text field is preserved
+    }
+
+    #[test]
+    fn parse_dialogue_rejects_non_dialogue() {
+        assert!(parse_ass_dialogue("Comment: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,x").is_none());
+        assert!(parse_ass_dialogue("[Script Info]").is_none());
     }
 }
