@@ -98,6 +98,10 @@ pub struct Subtitle {
     pub media_path: String,
     pub aid: i64,
     pub track: SubtitleTrack,
+    /// ASS Style field; empty for non-ASS tracks (mpv reports SRT as `Default`).
+    pub style: String,
+    /// ASS Name/Actor field; empty when unset or for non-ASS tracks.
+    pub name: String,
 }
 
 #[derive(Clone)]
@@ -438,6 +442,8 @@ async fn handle_mpv(
                 media_path: media_path.clone(),
                 aid: current_aid,
                 track,
+                style: style.to_string(),
+                name: name.to_string(),
             };
             debug!("[{}:{}] Broadcasting", track.as_str(), subtitle_id);
             info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
@@ -473,6 +479,8 @@ async fn handle_client(
                         "sub_start": sub.sub_start,
                         "sub_end": sub.sub_end,
                         "track": sub.track.as_str(),
+                        "style": sub.style,
+                        "name": sub.name,
                     }),
                     SubtitleEvent::MediaChanged(path) => serde_json::json!({
                         "type": "media_changed",
