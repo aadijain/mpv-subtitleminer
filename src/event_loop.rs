@@ -73,7 +73,7 @@ struct PendingSubtitle {
     id: u64,
     text: String,
     track: SubtitleTrack,
-    responses: [Option<serde_json::Value>; 4], // sub_start, sub_end, aid, sub_delay
+    responses: [Option<serde_json::Value>; 3], // sub_start, sub_end, sub_delay
 }
 
 impl PendingSubtitle {
@@ -87,7 +87,7 @@ impl PendingSubtitle {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 4 {
+        if index < 3 {
             self.responses[index] = Some(value);
         }
     }
@@ -97,13 +97,13 @@ impl PendingSubtitle {
     }
 
     fn sub_delay(&self) -> f64 {
-        self.responses[3]
+        self.responses[2]
             .as_ref()
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0)
     }
 
-    fn into_subtitle(self, media_path: String) -> Subtitle {
+    fn into_subtitle(self, media_path: String, aid: i64) -> Subtitle {
         let delay = self.sub_delay();
         Subtitle {
             id: self.id,
@@ -111,7 +111,7 @@ impl PendingSubtitle {
             sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
             sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
             media_path,
-            aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
+            aid,
             track: self.track,
         }
     }
@@ -261,12 +261,17 @@ async fn handle_mpv(
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
           {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n\
-          {\"command\":[\"observe_property\",3,\"path\"]}\n",
+          {\"command\":[\"observe_property\",3,\"path\"]}\n\
+          {\"command\":[\"observe_property\",4,\"aid\"]}\n",
     )
     .await?;
     info!("Connected to mpv, observing subtitle changes");
 
     let mut current_path: Option<String> = None;
+    // Latest selected audio track id, kept current via the `aid` observe (id 4)
+    // instead of being queried per subtitle. Defaults to track 1 until mpv sends
+    // the initial property-change for the observe.
+    let mut current_aid: i64 = 1;
     let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -302,7 +307,10 @@ async fn handle_mpv(
 
             for base_id in completed {
                 let media_path = current_path.clone().unwrap_or_default();
-                let sub = pending.remove(&base_id).unwrap().into_subtitle(media_path);
+                let sub = pending
+                    .remove(&base_id)
+                    .unwrap()
+                    .into_subtitle(media_path, current_aid);
                 debug!("[{}:{}] Broadcasting", sub.track.as_str(), sub.id);
                 state.subtitles.write().await.insert(sub.id, sub.clone());
                 let _ = tx.send(SubtitleEvent::New(sub));
@@ -329,6 +337,14 @@ async fn handle_mpv(
             continue;
         }
 
+        // Audio track changed (observer id 4)
+        if observer_id == Some(4) {
+            if let Some(aid) = json.get("data").and_then(|d| d.as_i64()) {
+                current_aid = aid;
+            }
+            continue;
+        }
+
         // Subtitle text changed: primary (observer id 1) or secondary (observer id 2).
         let track = match observer_id {
             Some(1) => SubtitleTrack::Primary,
@@ -347,22 +363,21 @@ async fn handle_mpv(
             let base_id = next_request_id;
             next_request_id += 10;
 
-            // Query all properties we need (per-track start/end/delay; shared aid)
+            // Query the per-track timing properties (start/end/delay); aid is
+            // observed separately (id 4) and read from `current_aid`.
             let (start_prop, end_prop, delay_prop) = track.properties();
             let cmd = format!(
                 concat!(
                     "{{\"command\":[\"get_property\",\"{0}\"],\"request_id\":{1}}}\n",
                     "{{\"command\":[\"get_property\",\"{2}\"],\"request_id\":{3}}}\n",
-                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{4}}}\n",
-                    "{{\"command\":[\"get_property\",\"{5}\"],\"request_id\":{6}}}\n"
+                    "{{\"command\":[\"get_property\",\"{4}\"],\"request_id\":{5}}}\n"
                 ),
                 start_prop,
                 base_id,
                 end_prop,
                 base_id + 1,
-                base_id + 2,
                 delay_prop,
-                base_id + 3
+                base_id + 2
             );
 
             mpv.write_all(cmd.as_bytes()).await?;
