@@ -692,40 +692,19 @@
   const isSelected = (uid: string) => selectedMessages.value.has(uid)
   const isSelectedSecondary = (uid: string) => selectedSecondary.value.has(uid)
 
-  // Sequential/contiguous selection within a single column's time-ordered list: clicking
-  // grows or shrinks one run from either end (mirrors the original single-list behaviour).
-  const toggleInColumn = (
-    target: Ref<Set<string>>,
-    list: SubtitleMessage[],
-    msg: SubtitleMessage,
-  ) => {
-    const index = list.findIndex((m) => m.uid === msg.uid)
-    if (index === -1) return
+  // Free selection within a column: clicking toggles a block in or out, with no contiguity
+  // requirement. Audio still spans the earliest selected start to the latest selected end as
+  // one continuous clip (see getSelectionRange + requestAudioRange), so non-adjacent picks
+  // include the gap between them rather than concatenating per-block clips.
+  const toggleInColumn = (target: Ref<Set<string>>, msg: SubtitleMessage) => {
     const selected = new Set(target.value)
-    const selectedIndices = () =>
-      Array.from(selected)
-        .map((uid) => list.findIndex((m) => m.uid === uid))
-        .filter((i) => i !== -1)
-        .sort((a, b) => a - b)
-
-    if (selected.has(msg.uid)) {
-      const idx = selectedIndices()
-      if (index === idx[0] || index === idx[idx.length - 1]) selected.delete(msg.uid)
-    } else if (selected.size === 0) {
-      selected.add(msg.uid)
-    } else {
-      const idx = selectedIndices()
-      const minIdx = idx[0] ?? index
-      const maxIdx = idx[idx.length - 1] ?? index
-      if (index === minIdx - 1 || index === maxIdx + 1) selected.add(msg.uid)
-    }
+    if (selected.has(msg.uid)) selected.delete(msg.uid)
+    else selected.add(msg.uid)
     target.value = selected
   }
 
-  const togglePrimary = (msg: SubtitleMessage) =>
-    toggleInColumn(selectedMessages, primaryMessages.value, msg)
-  const toggleSecondary = (msg: SubtitleMessage) =>
-    toggleInColumn(selectedSecondary, secondaryMessages.value, msg)
+  const togglePrimary = (msg: SubtitleMessage) => toggleInColumn(selectedMessages, msg)
+  const toggleSecondary = (msg: SubtitleMessage) => toggleInColumn(selectedSecondary, msg)
 
   const clearSelection = () => {
     selectedMessages.value = new Set()
