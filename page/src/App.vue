@@ -41,6 +41,7 @@
       secondaryCleanRegexEnabled: true,
       showSecondaryColumn: true,
       timelineZoom: 80,
+      primaryColumnFraction: 0.5,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -461,6 +462,44 @@
     return style
   }
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
+
+  // Drag-to-resize the split between the primary and secondary lanes. The boundary is stored as
+  // `primaryColumnFraction` (primary's share of the width after the fixed 56px time gutter) and
+  // drives the `--primary-frac` CSS var; clamped so neither column can be dragged away entirely.
+  const GUTTER_PX = 56
+  const COLUMN_FRAC_MIN = 0.2
+  const COLUMN_FRAC_MAX = 0.8
+  const tlBodyRef = ref<HTMLElement | null>(null)
+  const columnDragging = ref(false)
+
+  function startColumnDrag(e: PointerEvent) {
+    const body = tlBodyRef.value
+    if (!body) return
+    e.preventDefault()
+    const handle = e.currentTarget as HTMLElement
+    handle.setPointerCapture(e.pointerId)
+    columnDragging.value = true
+    const onMove = (ev: PointerEvent) => {
+      const rect = body.getBoundingClientRect()
+      const inner = rect.width - GUTTER_PX
+      if (inner <= 0) return
+      const frac = (ev.clientX - rect.left - GUTTER_PX) / inner
+      settings.value.display.primaryColumnFraction = Math.min(
+        COLUMN_FRAC_MAX,
+        Math.max(COLUMN_FRAC_MIN, frac),
+      )
+    }
+    const onUp = (ev: PointerEvent) => {
+      columnDragging.value = false
+      handle.releasePointerCapture(ev.pointerId)
+      handle.removeEventListener('pointermove', onMove)
+      handle.removeEventListener('pointerup', onUp)
+      handle.removeEventListener('pointercancel', onUp)
+    }
+    handle.addEventListener('pointermove', onMove)
+    handle.addEventListener('pointerup', onUp)
+    handle.addEventListener('pointercancel', onUp)
+  }
 
   // Scroll so the given subtitle sits just below the sticky header. The header's own height
   // cancels out (it occupies the top of the scroll content), so the target is simply its
@@ -1243,6 +1282,7 @@
         v-else
         class="timeline"
         :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }"
+        :style="{ '--primary-frac': settings.display.primaryColumnFraction }"
       >
         <div class="tl-head">
           <div class="tl-head-gutter">time</div>
@@ -1271,7 +1311,7 @@
           </div>
         </div>
 
-        <div class="tl-body" :style="{ height: `${timelineHeight}px` }">
+        <div ref="tlBodyRef" class="tl-body" :style="{ height: `${timelineHeight}px` }">
           <div class="tl-gutter">
             <div
               v-for="tick in ticks"
@@ -1394,6 +1434,13 @@
               >
             </div>
           </div>
+
+          <div
+            class="tl-divider"
+            :class="{ dragging: columnDragging }"
+            title="Drag to resize columns"
+            @pointerdown="startColumnDrag"
+          ></div>
         </div>
       </div>
     </main>
@@ -2115,6 +2162,21 @@
     justify-content: space-between;
     gap: 8px;
     padding: 5px 10px 5px 14px;
+    min-width: 0;
+  }
+
+  /* Header columns must use the SAME geometry as the lanes/divider below (which position by
+     calc((100% - 56px) * frac)), not flex proportions: each column's fixed padding + the 1px
+     inter-column border don't scale with the fraction, so a flex split only lines up near
+     frac=0.5 and drifts ~15px at the extremes. Give primary the exact calc width and let
+     secondary fill the rest; box-sizing:border-box keeps padding/border inside the box. */
+  .tl-head-col.primary {
+    flex: none;
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
+  }
+
+  .tl-head-col.secondary {
+    flex: 1 1 0;
   }
 
   .tl-head-col + .tl-head-col {
@@ -2177,7 +2239,7 @@
   .tl-gap {
     position: absolute;
     left: 56px;
-    width: calc((100% - 56px) / 2);
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
     z-index: 1;
     display: flex;
     align-items: center;
@@ -2209,19 +2271,61 @@
 
   .tl-lane.primary {
     left: 56px;
-    width: calc((100% - 56px) / 2);
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
     border-right: 1px solid #202630;
   }
 
   .tl-lane.secondary {
-    left: calc(56px + (100% - 56px) / 2);
+    left: calc(56px + (100% - 56px) * var(--primary-frac, 0.5));
     right: 0;
+  }
+
+  /* Draggable boundary between the two lanes; sits in the 8px block margins on either side of
+     the lane border so it never overlaps subtitle text. Hidden when secondary is collapsed. */
+  .tl-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(56px + (100% - 56px) * var(--primary-frac, 0.5));
+    width: 11px;
+    transform: translateX(-50%);
+    z-index: 7;
+    cursor: col-resize;
+    touch-action: none;
+  }
+
+  .tl-divider::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
+    background: transparent;
+    transition: background 0.15s ease;
+  }
+
+  .tl-divider:hover::before,
+  .tl-divider.dragging::before {
+    background: #5a9aca;
+  }
+
+  .timeline.hide-secondary .tl-divider {
+    display: none;
   }
 
   /* secondary column hidden: primary lane spans the full width */
   .timeline.hide-secondary .tl-head-col.secondary,
   .timeline.hide-secondary .tl-lane.secondary {
     display: none;
+  }
+
+  /* With the secondary col gone, drop the fixed calc width and let primary fill the row
+     (otherwise the "+ Secondary" button is stranded mid-row at the old split). */
+  .timeline.hide-secondary .tl-head-col.primary {
+    flex: 1 1 auto;
+    width: auto;
   }
 
   .timeline.hide-secondary .tl-lane.primary,
