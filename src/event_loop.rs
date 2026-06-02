@@ -1,17 +1,17 @@
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::media::FfmpegRequest;
 use crate::mpv_stream::MpvStream;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubtitleTrack {
     Primary,
     Secondary,
@@ -106,9 +106,63 @@ pub enum SubtitleEvent {
     MediaChanged(String),
 }
 
+/// Identity of an emitted subtitle: track, a coarse start-time bucket (see
+/// `DEDUP_BUCKET_MS`), and ASS Style/Name/text. The bucket lets mpv's exact
+/// re-reports of an overlapping event collapse while keeping the same text said
+/// again later as a distinct row.
+type SubtitleKey = (SubtitleTrack, i64, String, String, String);
+
+/// Width of the start-time bucket used in `SubtitleKey`, in milliseconds.
+const DEDUP_BUCKET_MS: i64 = 5000;
+
+/// Bounded set of recently emitted subtitle identities. mpv re-reports the same
+/// `Dialogue` line whenever an overlapping neighbor enters or leaves the screen,
+/// so without this every overlap spawns duplicate rows. FIFO eviction keeps
+/// memory flat; the cap bounds how far a backward seek can re-enter watched
+/// territory before lines re-emit.
+struct RecentSubtitles {
+    seen: HashSet<SubtitleKey>,
+    order: VecDeque<SubtitleKey>,
+    cap: usize,
+}
+
+impl RecentSubtitles {
+    fn new(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Records `key`; returns `true` if it was newly seen (caller should emit),
+    /// `false` if it's a duplicate to drop.
+    fn insert(&mut self, key: SubtitleKey) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
+        self.order.clear();
+    }
+}
+
 struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
     current_media_path: RwLock<Option<String>>,
+    /// Dedup set for the duplicate Dialogue lines mpv re-reports around overlaps.
+    /// Held here (not just in `handle_mpv`) so a client `clear` request can reset
+    /// it; reset on media change.
+    recent: Mutex<RecentSubtitles>,
 }
 
 impl SharedState {
@@ -116,6 +170,7 @@ impl SharedState {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
             current_media_path: RwLock::new(None),
+            recent: Mutex::new(RecentSubtitles::new(512)),
         })
     }
 }
@@ -306,6 +361,7 @@ async fn handle_mpv(
                 let path = path.to_string();
                 if current_path.as_deref() != Some(&path) {
                     current_path = Some(path.clone());
+                    state.recent.lock().await.clear();
                     *state.current_media_path.write().await = Some(path.clone());
                     let _ = tx.send(SubtitleEvent::MediaChanged(path));
                 }
@@ -355,11 +411,19 @@ async fn handle_mpv(
         // Each Dialogue line carries its own absolute Start/End, so overlapping
         // events become independent rows with correct timing.
         for dialogue in ass_full.lines() {
-            let Some((raw_start, raw_end, _style, _name, text)) = parse_ass_dialogue(dialogue)
+            let Some((raw_start, raw_end, style, name, text)) = parse_ass_dialogue(dialogue)
             else {
                 continue;
             };
             if text.is_empty() {
+                continue;
+            }
+
+            // Bucket the raw (pre-delay) start so re-reports collapse but the
+            // same text recurring later stays a distinct row.
+            let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
+            let key = (track, bucket, style.to_string(), name.to_string(), text.clone());
+            if !state.recent.lock().await.insert(key) {
                 continue;
             }
 
@@ -455,12 +519,20 @@ enum ProtocolRequest {
         offset_end: Option<f64>,
         audio_config: Option<crate::media::AudioConfig>,
     },
+    /// The UI "clear" button: reset the dedup set so already-seen subtitles can
+    /// stream in again (e.g. after clearing the screen and seeking back).
+    Clear,
 }
 
 async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) -> Option<String> {
     let request: ProtocolRequest = serde_json::from_str(text).ok()?;
 
     match request {
+        ProtocolRequest::Clear => {
+            state.recent.lock().await.clear();
+            info!("[client:{}] Cleared subtitle dedup set", client_id);
+            None
+        }
         ProtocolRequest::AudioRange {
             start_id,
             end_id,
@@ -622,5 +694,29 @@ mod tests {
     fn parse_dialogue_rejects_non_dialogue() {
         assert!(parse_ass_dialogue("Comment: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,x").is_none());
         assert!(parse_ass_dialogue("[Script Info]").is_none());
+    }
+
+    fn key(text: &str) -> SubtitleKey {
+        (SubtitleTrack::Primary, 0, "Default".to_string(), String::new(), text.to_string())
+    }
+
+    #[test]
+    fn recent_subtitles_dedups_repeats() {
+        let mut recent = RecentSubtitles::new(4);
+        assert!(recent.insert(key("a"))); // first sighting -> emit
+        assert!(!recent.insert(key("a"))); // re-report -> drop
+        assert!(recent.insert(key("b")));
+        recent.clear();
+        assert!(recent.insert(key("a"))); // cleared -> emit again
+    }
+
+    #[test]
+    fn recent_subtitles_evicts_oldest_past_cap() {
+        let mut recent = RecentSubtitles::new(2);
+        recent.insert(key("a"));
+        recent.insert(key("b"));
+        recent.insert(key("c")); // evicts "a"
+        assert!(recent.insert(key("a"))); // "a" no longer remembered -> emit
+        assert!(!recent.insert(key("c"))); // "c" still within window -> drop
     }
 }

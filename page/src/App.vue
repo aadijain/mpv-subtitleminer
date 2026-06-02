@@ -398,6 +398,9 @@
     selectedMessages.value = new Set()
     selectedSecondary.value = new Set()
     document.title = 'Subtitle Tool Page'
+    // Reset each connected server's dedup set so already-seen lines can stream in
+    // again (otherwise they'd be suppressed and never reappear on the cleared screen).
+    for (const port of ws.connectedPorts.value) ws.send({ request: 'clear' }, port)
   }
 
   function titleFromMediaPath(mediaPath: string): string {
