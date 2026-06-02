@@ -24,19 +24,9 @@ impl SubtitleTrack {
             SubtitleTrack::Secondary => "secondary",
         }
     }
-
-    /// (start, end) mpv property names for this track. Delay is observed
-    /// separately and applied from the cached value at emit time.
-    fn properties(self) -> (&'static str, &'static str) {
-        match self {
-            SubtitleTrack::Primary => ("sub-start", "sub-end"),
-            SubtitleTrack::Secondary => ("secondary-sub-start", "secondary-sub-end"),
-        }
-    }
 }
 
 /// Parses an ASS timestamp `H:MM:SS.cc` (centiseconds) into absolute seconds.
-#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
 fn parse_ass_time(s: &str) -> Option<f64> {
     let mut parts = s.trim().split(':');
     let h: f64 = parts.next()?.trim().parse().ok()?;
@@ -51,7 +41,6 @@ fn parse_ass_time(s: &str) -> Option<f64> {
 /// Converts an ASS event Text field to display text: drops `{...}` override
 /// blocks and converts hard breaks (`\N`, `\n`) to newlines and hard spaces
 /// (`\h`) to spaces.
-#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
 fn strip_ass_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -82,7 +71,6 @@ fn strip_ass_text(text: &str) -> String {
 /// `[Dialogue: ]Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
 /// Times are absolute seconds; `text` is display-cleaned. Returns `None` for any
 /// line that isn't a parseable Dialogue (headers, Comment lines, etc.).
-#[allow(dead_code)] // wired in by the ass-full subtitle source (next commit)
 fn parse_ass_dialogue(s: &str) -> Option<(f64, f64, &str, &str, String)> {
     let s = s.strip_prefix("Dialogue: ").unwrap_or(s);
     let mut parts = s.splitn(10, ',');
@@ -129,46 +117,6 @@ impl SharedState {
             subtitles: RwLock::new(HashMap::new()),
             current_media_path: RwLock::new(None),
         })
-    }
-}
-
-struct PendingSubtitle {
-    id: u64,
-    text: String,
-    track: SubtitleTrack,
-    responses: [Option<serde_json::Value>; 2], // sub_start, sub_end
-}
-
-impl PendingSubtitle {
-    fn new(id: u64, text: String, track: SubtitleTrack) -> Self {
-        Self {
-            id,
-            text,
-            track,
-            responses: Default::default(),
-        }
-    }
-
-    fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 2 {
-            self.responses[index] = Some(value);
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.responses.iter().all(|r| r.is_some())
-    }
-
-    fn into_subtitle(self, media_path: String, aid: i64, delay: f64) -> Subtitle {
-        Subtitle {
-            id: self.id,
-            text: self.text,
-            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
-            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
-            media_path,
-            aid,
-            track: self.track,
-        }
     }
 }
 
@@ -314,8 +262,8 @@ async fn handle_mpv(
     tx: broadcast::Sender<SubtitleEvent>,
 ) -> std::io::Result<()> {
     mpv.write_all(
-        b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
-          {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n\
+        b"{\"command\":[\"observe_property\",1,\"sub-text/ass-full\"]}\n\
+          {\"command\":[\"observe_property\",2,\"secondary-sub-text/ass-full\"]}\n\
           {\"command\":[\"observe_property\",3,\"path\"]}\n\
           {\"command\":[\"observe_property\",4,\"aid\"]}\n\
           {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n\
@@ -333,9 +281,7 @@ async fn handle_mpv(
     // (id 5 primary, id 6 secondary) and applied to timing at emit time.
     let mut current_sub_delay: f64 = 0.0;
     let mut current_secondary_sub_delay: f64 = 0.0;
-    let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
-    let mut next_request_id = 10u64;
     let mut line = String::new();
 
     loop {
@@ -347,39 +293,6 @@ async fn handle_mpv(
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-
-        // Handle property responses (request_id encodes: base_id + property_index)
-        if let Some(request_id) = json.get("request_id").and_then(|r| r.as_u64()) {
-            let base_id = request_id / 10 * 10; // Round down to base
-            let prop_idx = (request_id % 10) as usize;
-
-            if let Some(p) = pending.get_mut(&base_id)
-                && let Some(data) = json.get("data").cloned()
-            {
-                p.set_response(prop_idx, data);
-            }
-
-            // Try to complete pending subtitles
-            let completed: Vec<_> = pending
-                .iter()
-                .filter(|(_, p)| p.is_complete())
-                .map(|(id, _)| *id)
-                .collect();
-
-            for base_id in completed {
-                let media_path = current_path.clone().unwrap_or_default();
-                let p = pending.remove(&base_id).unwrap();
-                let delay = match p.track {
-                    SubtitleTrack::Primary => current_sub_delay,
-                    SubtitleTrack::Secondary => current_secondary_sub_delay,
-                };
-                let sub = p.into_subtitle(media_path, current_aid, delay);
-                debug!("[{}:{}] Broadcasting", sub.track.as_str(), sub.id);
-                state.subtitles.write().await.insert(sub.id, sub.clone());
-                let _ = tx.send(SubtitleEvent::New(sub));
-            }
-            continue;
-        }
 
         if json.get("event") != Some(&serde_json::json!("property-change")) {
             continue;
@@ -420,45 +333,54 @@ async fn handle_mpv(
             continue;
         }
 
-        // Subtitle text changed: primary (observer id 1) or secondary (observer id 2).
+        // Subtitle changed: primary (observer id 1) or secondary (observer id 2).
+        // The payload is the `sub-text/ass-full` value: zero or more `Dialogue:`
+        // lines (joined by newlines) describing every event currently on screen.
         let track = match observer_id {
             Some(1) => SubtitleTrack::Primary,
             Some(2) => SubtitleTrack::Secondary,
             _ => continue,
         };
 
-        if let Some(text) = json
-            .get("data")
-            .and_then(|d| d.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        let Some(ass_full) = json.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
+
+        let delay = match track {
+            SubtitleTrack::Primary => current_sub_delay,
+            SubtitleTrack::Secondary => current_secondary_sub_delay,
+        };
+        let media_path = current_path.clone().unwrap_or_default();
+
+        // Each Dialogue line carries its own absolute Start/End, so overlapping
+        // events become independent rows with correct timing.
+        for dialogue in ass_full.lines() {
+            let Some((raw_start, raw_end, _style, _name, text)) = parse_ass_dialogue(dialogue)
+            else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+
             let subtitle_id = next_subtitle_id;
             next_subtitle_id += 1;
 
-            let base_id = next_request_id;
-            next_request_id += 10;
-
-            // Query the per-track timing properties (start/end); aid and delay
-            // are observed separately and read from their cached values.
-            let (start_prop, end_prop) = track.properties();
-            let cmd = format!(
-                concat!(
-                    "{{\"command\":[\"get_property\",\"{0}\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"{2}\"],\"request_id\":{3}}}\n"
-                ),
-                start_prop,
-                base_id,
-                end_prop,
-                base_id + 1
-            );
-
-            mpv.write_all(cmd.as_bytes()).await?;
-            pending.insert(
-                base_id,
-                PendingSubtitle::new(subtitle_id, text.to_string(), track),
-            );
-            info!("[{}:{}] {}", track.as_str(), subtitle_id, text);
+            let sub = Subtitle {
+                id: subtitle_id,
+                text,
+                sub_start: raw_start + delay,
+                sub_end: raw_end + delay,
+                media_path: media_path.clone(),
+                aid: current_aid,
+                track,
+            };
+            debug!("[{}:{}] Broadcasting", track.as_str(), subtitle_id);
+            info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
+            state.subtitles.write().await.insert(subtitle_id, sub.clone());
+            let _ = tx.send(SubtitleEvent::New(sub));
         }
+        continue;
     }
 }
 
