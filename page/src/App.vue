@@ -2316,10 +2316,12 @@
 
   /* Header + filter chip row share one sticky wrapper so both stay pinned together while the
      timeline body scrolls (two separate sticky siblings would overlap at top: 0). */
+  /* Above the timeline body's hovered blocks (z-index 5) and the divider (7) so the pinned
+     header/filter always stays on top of subtitles scrolling under it. */
   .tl-sticky {
     position: sticky;
     top: 0;
-    z-index: 2;
+    z-index: 10;
   }
 
   .tl-head {
