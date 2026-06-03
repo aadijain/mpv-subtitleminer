@@ -357,6 +357,15 @@
     return value === hf.value ? 'hl' : 'dim'
   }
 
+  // Reverse preview: hovering a subtitle block lights up its own Style and Name chips so you
+  // can see which filters it belongs to.
+  const hoveredBlock = ref<{ track: SubtitleTrack; style: string; name: string } | null>(null)
+  const chipHighlighted = (track: SubtitleTrack, axis: FilterAxis, value: string): boolean => {
+    const hb = hoveredBlock.value
+    if (!hb || hb.track !== track) return false
+    return (axis === 'style' ? hb.style : hb.name) === value
+  }
+
   // Deterministic colour per Style/Name value (stable across renders, no state to track).
   // Both axes draw hues from the FULL colour wheel (15 evenly spaced buckets) so colours
   // within a single axis stay maximally far apart - confining an axis to one warm/cool arc is
@@ -1494,7 +1503,7 @@
                   v-for="tag in col.styleTags"
                   :key="`s-${tag.value}`"
                   class="tl-chip"
-                  :class="{ off: tag.hidden }"
+                  :class="{ off: tag.hidden, hot: chipHighlighted(col.track, 'style', tag.value) }"
                   type="button"
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'style', tag.value)"
@@ -1518,7 +1527,7 @@
                   v-for="tag in col.nameTags"
                   :key="`n-${tag.value}`"
                   class="tl-chip"
-                  :class="{ off: tag.hidden }"
+                  :class="{ off: tag.hidden, hot: chipHighlighted(col.track, 'name', tag.value) }"
                   type="button"
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'name', tag.value)"
@@ -1579,6 +1588,10 @@
               ]"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
+              @mouseenter="
+                hoveredBlock = { track: message.track, style: message.style, name: message.name }
+              "
+              @mouseleave="hoveredBlock = null"
             >
               <span
                 v-if="settings.display.styleColorCoding"
@@ -1673,6 +1686,10 @@
               ]"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
+              @mouseenter="
+                hoveredBlock = { track: message.track, style: message.style, name: message.name }
+              "
+              @mouseleave="hoveredBlock = null"
             >
               <span
                 v-if="settings.display.styleColorCoding"
@@ -2548,6 +2565,14 @@
     background: #2e3643;
     border-color: #3a4350;
     color: #eef2f7;
+  }
+
+  /* Reverse preview: chip lit up because its matching block is being hovered. */
+  .tl-chip.hot {
+    background: #2e3643;
+    border-color: #aeb9c9;
+    color: #eef2f7;
+    box-shadow: 0 0 0 1px rgba(174, 185, 201, 0.4);
   }
 
   .tl-chip-text {
