@@ -2366,7 +2366,9 @@
   }
 
   .tl-block.sel {
-    background: rgba(90, 154, 202, 0.15);
+    /* opaque equivalent of rgba(90,154,202,0.15) over the #1b1f26 base; a translucent fill
+       lets overlapping (absolutely-positioned) blocks show through and looks transparent */
+    background: #24313f;
     border-color: #5a9aca;
   }
 
@@ -2381,7 +2383,8 @@
   }
 
   .tl-block.secondary.sel {
-    background: rgba(61, 220, 151, 0.13);
+    /* opaque equivalent of rgba(61,220,151,0.13) over the #1b1f26 base */
+    background: #1f3835;
     border-color: #3ddc97;
   }
 
