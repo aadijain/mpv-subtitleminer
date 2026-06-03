@@ -240,6 +240,10 @@
     time_pos: number
     sub_start: number
     sub_end: number
+    // ASS Style field; mpv reports SRT lines as "Default". Empty for non-ASS tracks.
+    style: string
+    // ASS Name/Actor field; empty when unset or for non-ASS tracks.
+    name: string
     thumbnail?: string
     audio?: string
     sourcePort: number
@@ -706,6 +710,8 @@
       time_pos: normalizedTimePos,
       sub_start,
       sub_end,
+      style: asString(d.style) ?? '',
+      name: asString(d.name) ?? '',
       sourcePort: port,
       uid,
     }
