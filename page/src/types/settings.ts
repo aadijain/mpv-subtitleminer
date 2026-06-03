@@ -43,6 +43,7 @@ export interface DisplaySettings {
   showSecondaryColumn: boolean
   timelineZoom: number
   primaryColumnFraction: number
+  styleColorCoding: boolean
 }
 
 export interface Settings {

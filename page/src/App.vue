@@ -1,6 +1,15 @@
 <script setup lang="ts">
   import MediaConfiguration from './components/MediaConfiguration.vue'
-  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
+  import {
+    computed,
+    nextTick,
+    onBeforeUnmount,
+    onMounted,
+    reactive,
+    ref,
+    watch,
+    type Ref,
+  } from 'vue'
   import { useToast } from './composables/useToast'
   import { useWebSocket } from './composables/useWebSocket'
   import * as anki from './services/ankiConnect'
@@ -42,6 +51,7 @@
       showSecondaryColumn: true,
       timelineZoom: 80,
       primaryColumnFraction: 0.5,
+      styleColorCoding: true,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -240,6 +250,10 @@
     time_pos: number
     sub_start: number
     sub_end: number
+    // ASS Style field; mpv reports SRT lines as "Default". Empty for non-ASS tracks.
+    style: string
+    // ASS Name/Actor field; empty when unset or for non-ASS tracks.
+    name: string
     thumbnail?: string
     audio?: string
     sourcePort: number
@@ -257,14 +271,173 @@
   const selectedMessages = ref<Set<string>>(new Set())
   const selectedSecondary = ref<Set<string>>(new Set())
 
-  // Split the single message stream into two time-ordered columns by track.
+  // ── ASS style/name display filter ────────────────────────────────────────────────────
+  // Purely a UI display filter: hide subtitle lines by their ASS Style or Name, per track,
+  // without ever touching mpv. A line is shown only if BOTH its style and its name are
+  // enabled (AND semantics). Hidden lines drop out of `visibleMessages`, so the timeline
+  // axis, gap markers and overlap columns all recompute around what's left.
+  //  State persists across refreshes (localStorage).
+  type FilterAxis = 'style' | 'name'
+  // Persisted across refreshes (separate from the Anki/display settings blob so it can be
+  // cleared independently). Sets aren't JSON-serializable, so we store/restore them as arrays.
+  const FILTERS_STORAGE_KEY = 'mpv_subtitle_tool_hidden_filters'
+  type HiddenFiltersSnapshot = Record<SubtitleTrack, Record<FilterAxis, string[]>>
+  function loadHiddenFilters(): Record<SubtitleTrack, Record<FilterAxis, Set<string>>> {
+    const empty = () => ({
+      primary: { style: new Set<string>(), name: new Set<string>() },
+      secondary: { style: new Set<string>(), name: new Set<string>() },
+    })
+    try {
+      const stored = localStorage.getItem(FILTERS_STORAGE_KEY)
+      if (!stored) return empty()
+      const parsed = JSON.parse(stored) as Partial<HiddenFiltersSnapshot>
+      const result = empty()
+      for (const track of ['primary', 'secondary'] as SubtitleTrack[]) {
+        for (const axis of ['style', 'name'] as FilterAxis[]) {
+          for (const value of parsed[track]?.[axis] ?? []) result[track][axis].add(value)
+        }
+      }
+      return result
+    } catch (err) {
+      console.warn('Failed to load filters', err)
+      return empty()
+    }
+  }
+  const hiddenFilters =
+    reactive<Record<SubtitleTrack, Record<FilterAxis, Set<string>>>>(loadHiddenFilters())
+
+  watch(
+    hiddenFilters,
+    (value) => {
+      try {
+        const snapshot: HiddenFiltersSnapshot = {
+          primary: { style: [...value.primary.style], name: [...value.primary.name] },
+          secondary: { style: [...value.secondary.style], name: [...value.secondary.name] },
+        }
+        localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(snapshot))
+      } catch (err) {
+        console.warn('Failed to save filters', err)
+      }
+    },
+    { deep: true },
+  )
+
+  const isMessageVisible = (m: SubtitleMessage) =>
+    !hiddenFilters[m.track].style.has(m.style) && !hiddenFilters[m.track].name.has(m.name)
+
+  const toggleFilter = (track: SubtitleTrack, axis: FilterAxis, value: string) => {
+    const set = hiddenFilters[track][axis]
+    if (set.has(value)) set.delete(value)
+    else set.add(value)
+  }
+
+  // Distinct Style/Name values present per track, in first-seen order, each with a line
+  // count and current hidden state. Drives the filter chip row.
+  interface FilterTag {
+    value: string
+    count: number
+    hidden: boolean
+  }
+  const buildTags = (track: SubtitleTrack, axis: FilterAxis): FilterTag[] => {
+    const counts = new Map<string, number>()
+    for (const m of messages.value) {
+      if (m.track !== track) continue
+      const value = axis === 'style' ? m.style : m.name
+      counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+    return Array.from(counts, ([value, count]) => ({
+      value,
+      count,
+      hidden: hiddenFilters[track][axis].has(value),
+    }))
+  }
+  // One descriptor per track for the filter chip row: its Style and Name tags, whether to
+  // bother showing the Name group (only when some line actually carries a name), and whether
+  // anything is currently hidden (gates the per-column "show all" reset).
+  const filterColumns = computed(() =>
+    (['primary', 'secondary'] as SubtitleTrack[]).map((track) => {
+      const styleTags = buildTags(track, 'style')
+      const nameTags = buildTags(track, 'name')
+      return {
+        track,
+        styleTags,
+        nameTags,
+        showNames: nameTags.some((t) => t.value !== ''),
+        hasHidden: hiddenFilters[track].style.size > 0 || hiddenFilters[track].name.size > 0,
+      }
+    }),
+  )
+  const showAllForTrack = (track: SubtitleTrack) => {
+    hiddenFilters[track].style.clear()
+    hiddenFilters[track].name.clear()
+  }
+  const tagLabel = (value: string) => value || '(none)'
+
+  // The whole chip row collapses to a slim bar (session-only UI pref). When collapsed and a
+  // filter is active, the bar flags it so hidden lines aren't a silent surprise.
+  const filterCollapsed = ref(false)
+  const anyFilterHidden = computed(() => filterColumns.value.some((c) => c.hasHidden))
+
+  // Hovering a chip previews which lines it controls: blocks in the same track that match the
+  // hovered value light up ('hl'), the rest of that track recedes ('dim'). The other track is
+  // left neutral. Returns the class to add to a block (or '' when nothing is hovered).
+  const hoveredFilter = ref<{ track: SubtitleTrack; axis: FilterAxis; value: string } | null>(null)
+  const blockHoverClass = (m: SubtitleMessage): '' | 'hl' | 'dim' => {
+    const hf = hoveredFilter.value
+    if (!hf || m.track !== hf.track) return ''
+    const value = hf.axis === 'style' ? m.style : m.name
+    return value === hf.value ? 'hl' : 'dim'
+  }
+
+  // Reverse preview: hovering a subtitle block lights up its own Style and Name chips so you
+  // can see which filters it belongs to.
+  const hoveredBlock = ref<{ track: SubtitleTrack; style: string; name: string } | null>(null)
+  const chipHighlighted = (track: SubtitleTrack, axis: FilterAxis, value: string): boolean => {
+    const hb = hoveredBlock.value
+    if (!hb || hb.track !== track) return false
+    return (axis === 'style' ? hb.style : hb.name) === value
+  }
+
+  // Deterministic colour per Style/Name value (stable across renders, no state to track).
+  // Both axes draw hues from the FULL colour wheel (15 evenly spaced buckets) so colours
+  // within a single axis stay maximally far apart - confining an axis to one warm/cool arc is
+  // what made neighbouring values look alike. Style vs Name are told apart by tone instead:
+  // Style is vivid, Name is lighter/pastel (and the row labels + bar positions disambiguate).
+  // Empty value -> no colour (transparent slot).
+  const COLOR_BUCKETS = 15
+  function hueFor(value: string): number {
+    let h = 0
+    for (let i = 0; i < value.length; i++) h = (Math.imul(h, 31) + value.charCodeAt(i)) >>> 0
+    return Math.round(((h % COLOR_BUCKETS) * 360) / COLOR_BUCKETS)
+  }
+  const styleColor = (value: string): string | null =>
+    value ? `hsl(${hueFor(value)} 85% 62%)` : null
+  const nameColor = (value: string): string | null =>
+    value ? `hsl(${hueFor(value)} 70% 76%)` : null
+  const chipColor = (axis: FilterAxis, value: string): string | null =>
+    axis === 'style' ? styleColor(value) : nameColor(value)
+  // Two side-by-side vertical stripes for a block's left accent: outer = style, inner = name.
+  // The name stripe stays reserved (transparent) when the line has no name, so text alignment
+  // is identical whether or not a name is present.
+  const accentGradient = (m: SubtitleMessage): string => {
+    const s = styleColor(m.style) ?? 'transparent'
+    const n = nameColor(m.name) ?? 'transparent'
+    // style stripe | 1px near-black divider | name stripe. The divider only appears when both
+    // stripes exist, so an empty-name box still shows a single clean bar.
+    const div = m.style && m.name ? '#0a0c10' : 'transparent'
+    return `linear-gradient(to right, ${s} 0 3px, ${div} 3px 4px, ${n} 4px 7px)`
+  }
+
+  // Split the single message stream into two time-ordered columns by track, dropping any
+  // line hidden by the style/name filter so everything downstream readjusts.
   const sortByTime = (a: SubtitleMessage, b: SubtitleMessage) =>
     a.sub_start - b.sub_start || a.id - b.id
+  const visibleMessages = computed(() => messages.value.filter(isMessageVisible))
   const primaryMessages = computed(() =>
-    messages.value.filter((m) => m.track === 'primary').sort(sortByTime),
+    visibleMessages.value.filter((m) => m.track === 'primary').sort(sortByTime),
   )
   const secondaryMessages = computed(() =>
-    messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
+    visibleMessages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
   )
 
   // Google-Calendar-style overlap layout: split a lane into side-by-side columns for
@@ -346,10 +519,10 @@
   const pixelsPerSecond = computed(() => settings.value.display.timelineZoom)
 
   const timelineBounds = computed(() => {
-    if (messages.value.length === 0) return { start: 0, end: 1 }
+    if (visibleMessages.value.length === 0) return { start: 0, end: 1 }
     let start = Infinity
     let end = -Infinity
-    for (const m of messages.value) {
+    for (const m of visibleMessages.value) {
       if (m.sub_start < start) start = m.sub_start
       if (m.sub_end > end) end = m.sub_end
     }
@@ -368,11 +541,11 @@
   // scale; gaps render at min(trueHeight, MAX_GAP_PX).
   const timeline = computed(() => {
     const segs: TimelineSegment[] = []
-    if (messages.value.length === 0) return { segs, total: 0 }
+    if (visibleMessages.value.length === 0) return { segs, total: 0 }
     const { start, end } = timelineBounds.value
     const pps = pixelsPerSecond.value
 
-    const intervals = messages.value
+    const intervals = visibleMessages.value
       .map((m) => ({ a: m.sub_start, b: m.sub_end }))
       .sort((x, y) => x.a - y.a)
     const covered: { a: number; b: number }[] = []
@@ -514,6 +687,9 @@
     messages.value = []
     selectedMessages.value = new Set()
     selectedSecondary.value = new Set()
+    // Note: hiddenFilters is intentionally kept - clearing only wipes the displayed
+    // subtitles (and thus the chip list), not the user's style/name selections, which
+    // persist so the same styles/names stay hidden when lines stream back in.
     document.title = 'Subtitle Tool Page'
     // Reset each connected server's dedup set so already-seen lines can stream in
     // again (otherwise they'd be suppressed and never reappear on the cleared screen).
@@ -706,6 +882,8 @@
       time_pos: normalizedTimePos,
       sub_start,
       sub_end,
+      style: asString(d.style) ?? '',
+      name: asString(d.name) ?? '',
       sourcePort: port,
       uid,
     }
@@ -1284,30 +1462,131 @@
         :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }"
         :style="{ '--primary-frac': settings.display.primaryColumnFraction }"
       >
-        <div class="tl-head">
-          <div class="tl-head-gutter">time</div>
-          <div class="tl-head-col primary">
-            <span>Primary</span>
-            <button
-              v-if="!settings.display.showSecondaryColumn"
-              class="tl-head-toggle"
-              type="button"
-              title="Show secondary column"
-              @click="settings.display.showSecondaryColumn = true"
-            >
-              + Secondary
-            </button>
+        <div class="tl-sticky">
+          <div class="tl-head">
+            <div class="tl-head-gutter">time</div>
+            <div class="tl-head-col primary">
+              <span>Primary</span>
+              <button
+                v-if="!settings.display.showSecondaryColumn"
+                class="tl-head-toggle"
+                type="button"
+                title="Show secondary column"
+                @click="settings.display.showSecondaryColumn = true"
+              >
+                + Secondary
+              </button>
+            </div>
+            <div class="tl-head-col secondary">
+              <span>Secondary</span>
+              <button
+                class="tl-head-toggle"
+                type="button"
+                title="Hide secondary column"
+                @click="settings.display.showSecondaryColumn = false"
+              >
+                Hide
+              </button>
+            </div>
           </div>
-          <div class="tl-head-col secondary">
-            <span>Secondary</span>
+
+          <!-- Style/Name filter chips: a UI-only display filter. Each chip toggles whether
+               lines with that ASS Style or Name show in its column; nothing is sent to mpv. -->
+          <div class="tl-filter" :class="{ collapsed: filterCollapsed }">
             <button
-              class="tl-head-toggle"
+              class="tl-filter-toggle"
               type="button"
-              title="Hide secondary column"
-              @click="settings.display.showSecondaryColumn = false"
+              :title="filterCollapsed ? 'Show style/name filters' : 'Hide style/name filters'"
+              :aria-expanded="!filterCollapsed"
+              @click="filterCollapsed = !filterCollapsed"
             >
-              Hide
+              <svg
+                class="chev"
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
             </button>
+            <button
+              v-if="filterCollapsed"
+              class="tl-filter-summary"
+              type="button"
+              @click="filterCollapsed = false"
+            >
+              Style / Name filter
+              <span v-if="anyFilterHidden" class="tl-filter-active">· active</span>
+            </button>
+            <div
+              v-for="col in filterColumns"
+              v-show="!filterCollapsed"
+              :key="col.track"
+              class="tl-filter-col"
+              :class="col.track"
+            >
+              <!-- Style and Name each get their own row so the two axes don't run together. -->
+              <div v-if="col.styleTags.length" class="tl-filter-group">
+                <span class="tl-filter-label">Style:</span>
+                <button
+                  v-for="tag in col.styleTags"
+                  :key="`s-${tag.value}`"
+                  class="tl-chip"
+                  :class="{ off: tag.hidden, hot: chipHighlighted(col.track, 'style', tag.value) }"
+                  type="button"
+                  :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
+                  @click="toggleFilter(col.track, 'style', tag.value)"
+                  @mouseenter="
+                    hoveredFilter = { track: col.track, axis: 'style', value: tag.value }
+                  "
+                  @mouseleave="hoveredFilter = null"
+                >
+                  <span
+                    v-if="settings.display.styleColorCoding && chipColor('style', tag.value)"
+                    class="tl-chip-dot"
+                    :style="{ background: chipColor('style', tag.value) ?? undefined }"
+                  ></span>
+                  <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
+                  <span class="tl-chip-count">{{ tag.count }}</span>
+                </button>
+              </div>
+              <div v-if="col.showNames" class="tl-filter-group">
+                <span class="tl-filter-label">Name:</span>
+                <button
+                  v-for="tag in col.nameTags"
+                  :key="`n-${tag.value}`"
+                  class="tl-chip"
+                  :class="{ off: tag.hidden, hot: chipHighlighted(col.track, 'name', tag.value) }"
+                  type="button"
+                  :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
+                  @click="toggleFilter(col.track, 'name', tag.value)"
+                  @mouseenter="hoveredFilter = { track: col.track, axis: 'name', value: tag.value }"
+                  @mouseleave="hoveredFilter = null"
+                >
+                  <span
+                    v-if="settings.display.styleColorCoding && chipColor('name', tag.value)"
+                    class="tl-chip-dot"
+                    :style="{ background: chipColor('name', tag.value) ?? undefined }"
+                  ></span>
+                  <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
+                  <span class="tl-chip-count">{{ tag.count }}</span>
+                </button>
+              </div>
+              <button
+                v-if="col.hasHidden"
+                class="tl-chip show-all"
+                type="button"
+                title="Show all in this column"
+                @click="showAllForTrack(col.track)"
+              >
+                show all
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1337,10 +1616,22 @@
               v-for="message in primaryMessages"
               :key="message.uid"
               class="tl-block"
-              :class="{ sel: isSelected(message.uid), cal: !!slotOf(message) }"
+              :class="[
+                { sel: isSelected(message.uid), cal: !!slotOf(message) },
+                blockHoverClass(message),
+              ]"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
+              @mouseenter="
+                hoveredBlock = { track: message.track, style: message.style, name: message.name }
+              "
+              @mouseleave="hoveredBlock = null"
             >
+              <span
+                v-if="settings.display.styleColorCoding"
+                class="tl-accent"
+                :style="{ background: accentGradient(message) }"
+              ></span>
               <span
                 class="tl-text"
                 :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
@@ -1423,10 +1714,22 @@
               v-for="message in secondaryMessages"
               :key="message.uid"
               class="tl-block secondary"
-              :class="{ sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) }"
+              :class="[
+                { sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) },
+                blockHoverClass(message),
+              ]"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
+              @mouseenter="
+                hoveredBlock = { track: message.track, style: message.style, name: message.name }
+              "
+              @mouseleave="hoveredBlock = null"
             >
+              <span
+                v-if="settings.display.styleColorCoding"
+                class="tl-accent"
+                :style="{ background: accentGradient(message) }"
+              ></span>
               <span
                 class="tl-text"
                 :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
@@ -1750,6 +2053,25 @@
                     <span>Out</span>
                     <span>In</span>
                   </div>
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.styleColorCoding"
+                        @change="
+                          (e) =>
+                            (localDisplay.styleColorCoding = (e.target as HTMLInputElement).checked)
+                        "
+                      />
+                    </label>
+                    Color code subtitles by style / name
+                  </span>
+                  <small class="field-hint"
+                    >Toggles accent colors based on each subtitle's style / name metadata. Affects
+                    display only.</small
+                  >
                 </label>
               </div>
             </section>
@@ -2136,10 +2458,17 @@
     position: relative;
   }
 
-  .tl-head {
+  /* Header + filter chip row share one sticky wrapper so both stay pinned together while the
+     timeline body scrolls (two separate sticky siblings would overlap at top: 0). */
+  /* Above the timeline body's hovered blocks (z-index 5) and the divider (7) so the pinned
+     header/filter always stays on top of subtitles scrolling under it. */
+  .tl-sticky {
     position: sticky;
     top: 0;
-    z-index: 2;
+    z-index: 10;
+  }
+
+  .tl-head {
     display: flex;
     background: #1b1f26;
     border-bottom: 1px solid #252b34;
@@ -2147,6 +2476,173 @@
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: #7c8aa1;
+  }
+
+  .tl-filter {
+    display: flex;
+    align-items: flex-start;
+    background: #15191f;
+    border-bottom: 1px solid #252b34;
+  }
+
+  /* Collapse toggle occupies the 56px gutter slot so the columns still line up with the lanes. */
+  .tl-filter-toggle {
+    flex: none;
+    width: 56px;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #7c8aa1;
+    cursor: pointer;
+  }
+  .tl-filter-toggle:hover {
+    color: #e9edf2;
+  }
+  .tl-filter-toggle .chev {
+    transition: transform 0.15s ease;
+  }
+  .tl-filter.collapsed .tl-filter-toggle .chev {
+    transform: rotate(-90deg);
+  }
+
+  .tl-filter-summary {
+    flex: 1;
+    align-self: stretch;
+    text-align: left;
+    padding: 7px 0;
+    background: transparent;
+    border: none;
+    color: #5f6b7d;
+    font: inherit;
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  .tl-filter-summary:hover {
+    color: #a7b4c7;
+  }
+  .tl-filter-active {
+    color: #5a9aca;
+    letter-spacing: 0;
+  }
+
+  .tl-filter-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+    padding: 6px 10px 7px 14px;
+    min-width: 0;
+  }
+
+  /* One row per axis (Style row, Name row); chips wrap within the row. */
+  .tl-filter-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 5px;
+    min-width: 0;
+  }
+
+  /* Match the lane/header geometry exactly (calc width for primary, fill for secondary) so
+     each column's chips sit under their column. */
+  .tl-filter-col.primary {
+    flex: none;
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
+  }
+
+  .tl-filter-col.secondary {
+    flex: 1 1 0;
+  }
+
+  .tl-filter-col + .tl-filter-col {
+    border-left: 1px solid #252b34;
+  }
+
+  .tl-filter-label {
+    flex: none;
+    /* fixed width so the Style: and Name: rows line their chips up at the same x */
+    min-width: 3.4em;
+    font-size: 0.66em;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: #5f6b7d;
+  }
+
+  .tl-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 16ch;
+    padding: 2px 7px;
+    border: 1px solid #2f3742;
+    border-radius: 11px;
+    background: #232934;
+    color: #c4cedd;
+    font: inherit;
+    font-size: 0.74em;
+    line-height: 1.4;
+    cursor: pointer;
+    transition:
+      background 0.13s ease,
+      border-color 0.13s ease,
+      color 0.13s ease,
+      opacity 0.13s ease;
+  }
+
+  .tl-chip:hover {
+    background: #2e3643;
+    border-color: #3a4350;
+    color: #eef2f7;
+  }
+
+  /* Reverse preview: chip lit up because its matching block is being hovered. */
+  .tl-chip.hot {
+    background: #2e3643;
+    border-color: #aeb9c9;
+    color: #eef2f7;
+    box-shadow: 0 0 0 1px rgba(174, 185, 201, 0.4);
+  }
+
+  .tl-chip-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tl-chip-count {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.92em;
+    color: #7c8aa1;
+  }
+
+  /* Hidden (filtered-out) value: dimmed + struck so it reads as "off". */
+  .tl-chip.off {
+    background: #1a1e25;
+    border-color: #272d37;
+    color: #616c7d;
+    opacity: 0.75;
+  }
+  .tl-chip.off .tl-chip-text {
+    text-decoration: line-through;
+  }
+  .tl-chip.off .tl-chip-count {
+    color: #4d5664;
+  }
+
+  .tl-chip.show-all {
+    border-style: dashed;
+    border-radius: 6px;
+    color: #8c97a8;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.66em;
   }
 
   .tl-head-gutter {
@@ -2317,13 +2813,15 @@
 
   /* secondary column hidden: primary lane spans the full width */
   .timeline.hide-secondary .tl-head-col.secondary,
+  .timeline.hide-secondary .tl-filter-col.secondary,
   .timeline.hide-secondary .tl-lane.secondary {
     display: none;
   }
 
   /* With the secondary col gone, drop the fixed calc width and let primary fill the row
      (otherwise the "+ Secondary" button is stranded mid-row at the old split). */
-  .timeline.hide-secondary .tl-head-col.primary {
+  .timeline.hide-secondary .tl-head-col.primary,
+  .timeline.hide-secondary .tl-filter-col.primary {
     flex: 1 1 auto;
     width: auto;
   }
@@ -2344,7 +2842,9 @@
     display: flex;
     align-items: flex-start;
     gap: 6px;
-    padding: 7px 9px;
+    /* extra left padding clears the 7px style/name accent bar (kept even when colour-coding
+       is off so block text alignment doesn't shift when the toggle changes) */
+    padding: 7px 9px 7px 14px;
     border: 1px solid #232a33;
     border-radius: 8px;
     background: #1b1f26;
@@ -2353,6 +2853,8 @@
     transition:
       background 0.15s ease,
       border-color 0.15s ease,
+      box-shadow 0.12s ease,
+      opacity 0.12s ease,
       left 0.12s ease,
       width 0.12s ease;
   }
@@ -2365,31 +2867,54 @@
     width: calc((100% - 16px) * var(--width, 1) - 3px);
   }
 
+  /* Selection: the left edge now carries the style/name accent bars, so selection reads via
+     an opaque fill + coloured border + a 1px glow ring (no left bar). */
   .tl-block.sel {
     /* opaque equivalent of rgba(90,154,202,0.15) over the #1b1f26 base; a translucent fill
        lets overlapping (absolutely-positioned) blocks show through and looks transparent */
     background: #24313f;
     border-color: #5a9aca;
-  }
-
-  .tl-block.sel::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: #5a9aca;
+    box-shadow: 0 0 0 1px rgba(90, 154, 202, 0.55);
   }
 
   .tl-block.secondary.sel {
     /* opaque equivalent of rgba(61,220,151,0.13) over the #1b1f26 base */
     background: #1f3835;
     border-color: #3ddc97;
+    box-shadow: 0 0 0 1px rgba(61, 220, 151, 0.5);
   }
 
-  .tl-block.secondary.sel::before {
-    background: #3ddc97;
+  /* Chip-hover preview: matching blocks light up, the rest of that track recedes. Placed
+     after .sel so the highlight ring wins over the selection ring while previewing. */
+  .tl-block.hl {
+    border-color: #aeb9c9;
+    box-shadow:
+      0 0 0 2px rgba(174, 185, 201, 0.45),
+      0 4px 16px rgba(0, 0, 0, 0.5);
+    z-index: 4;
+  }
+  .tl-block.dim {
+    opacity: 0.3;
+  }
+
+  /* Two-stripe style/name accent painted via a gradient on this element (outer = style,
+     inner = name). Inset 1px so the block's own border stays visible around it. */
+  .tl-accent {
+    position: absolute;
+    left: 1px;
+    top: 1px;
+    bottom: 1px;
+    width: 7px;
+    border-top-left-radius: 7px;
+    border-bottom-left-radius: 7px;
+    pointer-events: none;
+  }
+
+  .tl-chip-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
   }
 
   /* On hover the block grows to show its full text (and overlays neighbours below). Placed
