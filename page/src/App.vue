@@ -683,14 +683,14 @@
     el.scrollTop = Math.max(0, yFor(msg.sub_start) - 16)
   }
 
+  // Wipes the displayed subtitles (message list + timeline, both derived from `messages`)
+  // and the current selection. Does NOT touch the page title - callers that need to retitle
+  // (e.g. a media change) do so themselves. hiddenFilters is intentionally kept so the same
+  // style/name selections stay hidden when lines stream back in.
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
     selectedSecondary.value = new Set()
-    // Note: hiddenFilters is intentionally kept - clearing only wipes the displayed
-    // subtitles (and thus the chip list), not the user's style/name selections, which
-    // persist so the same styles/names stay hidden when lines stream back in.
-    document.title = 'Subtitle Tool Page'
     // Reset each connected server's dedup set so already-seen lines can stream in
     // again (otherwise they'd be suppressed and never reappear on the cleared screen).
     for (const port of ws.connectedPorts.value) ws.send({ request: 'clear' }, port)
@@ -764,6 +764,10 @@
     localPortInput.value = localConnection.value.ports.join(', ')
   }
 
+  // Tracks the media path the UI last reflected, so a media_changed re-sent on reconnect
+  // (same path) doesn't clear the list - only an actual file change does.
+  let lastMediaPath: string | null = null
+
   const ws = useWebSocket({
     host,
     ports,
@@ -776,6 +780,14 @@
 
       if (type === 'media_changed') {
         const path = asString(d.path)
+        // The server re-sends media_changed on every (re)connect to seed the title, so only
+        // treat it as a real file change (and clear) when the path actually differs - otherwise
+        // a transient WebSocket reconnect would wipe the accumulated list. A new file's subs are
+        // stale, so clear them just like the Clear button does, then retitle for the new file.
+        if (path !== lastMediaPath) {
+          lastMediaPath = path
+          clearMessages()
+        }
         document.title = path ? titleFromMediaPath(path) : 'Subtitle Tool Page'
         return
       }
