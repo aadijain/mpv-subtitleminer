@@ -51,6 +51,7 @@
       showSecondaryColumn: true,
       timelineZoom: 80,
       primaryColumnFraction: 0.5,
+      styleColorCoding: true,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -344,6 +345,36 @@
   // filter is active, the bar flags it so hidden lines aren't a silent surprise.
   const filterCollapsed = ref(false)
   const anyFilterHidden = computed(() => filterColumns.value.some((c) => c.hasHidden))
+
+  // Deterministic colour per Style/Name value (stable across renders, no state to track).
+  // Both axes draw hues from the FULL colour wheel (15 evenly spaced buckets) so colours
+  // within a single axis stay maximally far apart - confining an axis to one warm/cool arc is
+  // what made neighbouring values look alike. Style vs Name are told apart by tone instead:
+  // Style is vivid, Name is lighter/pastel (and the row labels + bar positions disambiguate).
+  // Empty value -> no colour (transparent slot).
+  const COLOR_BUCKETS = 15
+  function hueFor(value: string): number {
+    let h = 0
+    for (let i = 0; i < value.length; i++) h = (Math.imul(h, 31) + value.charCodeAt(i)) >>> 0
+    return Math.round(((h % COLOR_BUCKETS) * 360) / COLOR_BUCKETS)
+  }
+  const styleColor = (value: string): string | null =>
+    value ? `hsl(${hueFor(value)} 85% 62%)` : null
+  const nameColor = (value: string): string | null =>
+    value ? `hsl(${hueFor(value)} 70% 76%)` : null
+  const chipColor = (axis: FilterAxis, value: string): string | null =>
+    axis === 'style' ? styleColor(value) : nameColor(value)
+  // Two side-by-side vertical stripes for a block's left accent: outer = style, inner = name.
+  // The name stripe stays reserved (transparent) when the line has no name, so text alignment
+  // is identical whether or not a name is present.
+  const accentGradient = (m: SubtitleMessage): string => {
+    const s = styleColor(m.style) ?? 'transparent'
+    const n = nameColor(m.name) ?? 'transparent'
+    // style stripe | 1px near-black divider | name stripe. The divider only appears when both
+    // stripes exist, so an empty-name box still shows a single clean bar.
+    const div = m.style && m.name ? '#0a0c10' : 'transparent'
+    return `linear-gradient(to right, ${s} 0 3px, ${div} 3px 4px, ${n} 4px 7px)`
+  }
 
   // Split the single message stream into two time-ordered columns by track, dropping any
   // line hidden by the style/name filter so everything downstream readjusts.
@@ -1457,6 +1488,11 @@
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'style', tag.value)"
                 >
+                  <span
+                    v-if="settings.display.styleColorCoding && chipColor('style', tag.value)"
+                    class="tl-chip-dot"
+                    :style="{ background: chipColor('style', tag.value) ?? undefined }"
+                  ></span>
                   <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
                   <span class="tl-chip-count">{{ tag.count }}</span>
                 </button>
@@ -1472,6 +1508,11 @@
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'name', tag.value)"
                 >
+                  <span
+                    v-if="settings.display.styleColorCoding && chipColor('name', tag.value)"
+                    class="tl-chip-dot"
+                    :style="{ background: chipColor('name', tag.value) ?? undefined }"
+                  ></span>
                   <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
                   <span class="tl-chip-count">{{ tag.count }}</span>
                 </button>
@@ -1519,6 +1560,11 @@
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
             >
+              <span
+                v-if="settings.display.styleColorCoding"
+                class="tl-accent"
+                :style="{ background: accentGradient(message) }"
+              ></span>
               <span
                 class="tl-text"
                 :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
@@ -1605,6 +1651,11 @@
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
+              <span
+                v-if="settings.display.styleColorCoding"
+                class="tl-accent"
+                :style="{ background: accentGradient(message) }"
+              ></span>
               <span
                 class="tl-text"
                 :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
@@ -1928,6 +1979,25 @@
                     <span>Out</span>
                     <span>In</span>
                   </div>
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.styleColorCoding"
+                        @change="
+                          (e) =>
+                            (localDisplay.styleColorCoding = (e.target as HTMLInputElement).checked)
+                        "
+                      />
+                    </label>
+                    Color code subtitles by style / name
+                  </span>
+                  <small class="field-hint"
+                    >Toggles accent colors based on each subtitle's style / name metadata. Affects
+                    display only.</small
+                  >
                 </label>
               </div>
             </section>
@@ -2690,7 +2760,9 @@
     display: flex;
     align-items: flex-start;
     gap: 6px;
-    padding: 7px 9px;
+    /* extra left padding clears the 7px style/name accent bar (kept even when colour-coding
+       is off so block text alignment doesn't shift when the toggle changes) */
+    padding: 7px 9px 7px 14px;
     border: 1px solid #232a33;
     border-radius: 8px;
     background: #1b1f26;
@@ -2711,31 +2783,41 @@
     width: calc((100% - 16px) * var(--width, 1) - 3px);
   }
 
+  /* Selection: the left edge now carries the style/name accent bars, so selection reads via
+     an opaque fill + coloured border + a 1px glow ring (no left bar). */
   .tl-block.sel {
     /* opaque equivalent of rgba(90,154,202,0.15) over the #1b1f26 base; a translucent fill
        lets overlapping (absolutely-positioned) blocks show through and looks transparent */
     background: #24313f;
     border-color: #5a9aca;
-  }
-
-  .tl-block.sel::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: #5a9aca;
+    box-shadow: 0 0 0 1px rgba(90, 154, 202, 0.55);
   }
 
   .tl-block.secondary.sel {
     /* opaque equivalent of rgba(61,220,151,0.13) over the #1b1f26 base */
     background: #1f3835;
     border-color: #3ddc97;
+    box-shadow: 0 0 0 1px rgba(61, 220, 151, 0.5);
   }
 
-  .tl-block.secondary.sel::before {
-    background: #3ddc97;
+  /* Two-stripe style/name accent painted via a gradient on this element (outer = style,
+     inner = name). Inset 1px so the block's own border stays visible around it. */
+  .tl-accent {
+    position: absolute;
+    left: 1px;
+    top: 1px;
+    bottom: 1px;
+    width: 7px;
+    border-top-left-radius: 7px;
+    border-bottom-left-radius: 7px;
+    pointer-events: none;
+  }
+
+  .tl-chip-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
   }
 
   /* On hover the block grows to show its full text (and overlays neighbours below). Placed

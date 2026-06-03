@@ -21,6 +21,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - *(fork)* Page title updates based on currently playing media file name.
 - *(fork)* Secondary (alt) subtitle support: primary and secondary tracks stream as parallel columns in a vertical timeline, each independently selectable.
 - *(fork)* Overlapping / Simulataneous subtitle handling (e.g. signs / sfx / TL Notes)
+- *(fork)* Live ASS Style/Name filter with color highlighting
 
 ## Downloads
 
