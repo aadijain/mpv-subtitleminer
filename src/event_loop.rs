@@ -1,17 +1,17 @@
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::media::FfmpegRequest;
 use crate::mpv_stream::MpvStream;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubtitleTrack {
     Primary,
     Secondary,
@@ -24,15 +24,69 @@ impl SubtitleTrack {
             SubtitleTrack::Secondary => "secondary",
         }
     }
+}
 
-    /// (start, end) mpv property names for this track. Delay is observed
-    /// separately and applied from the cached value at emit time.
-    fn properties(self) -> (&'static str, &'static str) {
-        match self {
-            SubtitleTrack::Primary => ("sub-start", "sub-end"),
-            SubtitleTrack::Secondary => ("secondary-sub-start", "secondary-sub-end"),
+/// Parses an ASS timestamp `H:MM:SS.cc` (centiseconds) into absolute seconds.
+fn parse_ass_time(s: &str) -> Option<f64> {
+    let mut parts = s.trim().split(':');
+    let h: f64 = parts.next()?.trim().parse().ok()?;
+    let m: f64 = parts.next()?.trim().parse().ok()?;
+    let sec: f64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// Converts an ASS event Text field to display text: drops `{...}` override
+/// blocks and converts hard breaks (`\N`, `\n`) to newlines and hard spaces
+/// (`\h`) to spaces.
+fn strip_ass_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_override = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => in_override = true,
+            '}' => in_override = false,
+            _ if in_override => {}
+            '\\' => match chars.peek() {
+                Some('N') | Some('n') => {
+                    out.push('\n');
+                    chars.next();
+                }
+                Some('h') => {
+                    out.push(' ');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            },
+            _ => out.push(c),
         }
     }
+    out
+}
+
+/// Extracts `(start, end, style, name, text)` from a single ASS Dialogue line:
+/// `[Dialogue: ]Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
+/// Times are absolute seconds; `text` is display-cleaned. Returns `None` for any
+/// line that isn't a parseable Dialogue (headers, Comment lines, etc.).
+fn parse_ass_dialogue(s: &str) -> Option<(f64, f64, &str, &str, String)> {
+    let s = s.strip_prefix("Dialogue: ").unwrap_or(s);
+    let mut parts = s.splitn(10, ',');
+    // Layer is always an integer in a real Dialogue event; this also rejects
+    // Comment lines and headers that happen to share the comma layout.
+    parts.next()?.trim().parse::<i64>().ok()?;
+    let start = parse_ass_time(parts.next()?)?;
+    let end = parse_ass_time(parts.next()?)?;
+    let style = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    parts.next()?; // MarginL
+    parts.next()?; // MarginR
+    parts.next()?; // MarginV
+    parts.next()?; // Effect
+    let text = parts.next()?;
+    Some((start, end, style, name, strip_ass_text(text)))
 }
 
 #[derive(Clone)]
@@ -52,9 +106,63 @@ pub enum SubtitleEvent {
     MediaChanged(String),
 }
 
+/// Identity of an emitted subtitle: track, a coarse start-time bucket (see
+/// `DEDUP_BUCKET_MS`), and ASS Style/Name/text. The bucket lets mpv's exact
+/// re-reports of an overlapping event collapse while keeping the same text said
+/// again later as a distinct row.
+type SubtitleKey = (SubtitleTrack, i64, String, String, String);
+
+/// Width of the start-time bucket used in `SubtitleKey`, in milliseconds.
+const DEDUP_BUCKET_MS: i64 = 5000;
+
+/// Bounded set of recently emitted subtitle identities. mpv re-reports the same
+/// `Dialogue` line whenever an overlapping neighbor enters or leaves the screen,
+/// so without this every overlap spawns duplicate rows. FIFO eviction keeps
+/// memory flat; the cap bounds how far a backward seek can re-enter watched
+/// territory before lines re-emit.
+struct RecentSubtitles {
+    seen: HashSet<SubtitleKey>,
+    order: VecDeque<SubtitleKey>,
+    cap: usize,
+}
+
+impl RecentSubtitles {
+    fn new(cap: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Records `key`; returns `true` if it was newly seen (caller should emit),
+    /// `false` if it's a duplicate to drop.
+    fn insert(&mut self, key: SubtitleKey) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.cap
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
+        self.order.clear();
+    }
+}
+
 struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
     current_media_path: RwLock<Option<String>>,
+    /// Dedup set for the duplicate Dialogue lines mpv re-reports around overlaps.
+    /// Held here (not just in `handle_mpv`) so a client `clear` request can reset
+    /// it; reset on media change.
+    recent: Mutex<RecentSubtitles>,
 }
 
 impl SharedState {
@@ -62,47 +170,8 @@ impl SharedState {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
             current_media_path: RwLock::new(None),
+            recent: Mutex::new(RecentSubtitles::new(512)),
         })
-    }
-}
-
-struct PendingSubtitle {
-    id: u64,
-    text: String,
-    track: SubtitleTrack,
-    responses: [Option<serde_json::Value>; 2], // sub_start, sub_end
-}
-
-impl PendingSubtitle {
-    fn new(id: u64, text: String, track: SubtitleTrack) -> Self {
-        Self {
-            id,
-            text,
-            track,
-            responses: Default::default(),
-        }
-    }
-
-    fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 2 {
-            self.responses[index] = Some(value);
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.responses.iter().all(|r| r.is_some())
-    }
-
-    fn into_subtitle(self, media_path: String, aid: i64, delay: f64) -> Subtitle {
-        Subtitle {
-            id: self.id,
-            text: self.text,
-            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
-            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
-            media_path,
-            aid,
-            track: self.track,
-        }
     }
 }
 
@@ -246,8 +315,8 @@ async fn handle_mpv(
     tx: broadcast::Sender<SubtitleEvent>,
 ) -> std::io::Result<()> {
     mpv.write_all(
-        b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
-          {\"command\":[\"observe_property\",2,\"secondary-sub-text\"]}\n\
+        b"{\"command\":[\"observe_property\",1,\"sub-text/ass-full\"]}\n\
+          {\"command\":[\"observe_property\",2,\"secondary-sub-text/ass-full\"]}\n\
           {\"command\":[\"observe_property\",3,\"path\"]}\n\
           {\"command\":[\"observe_property\",4,\"aid\"]}\n\
           {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n\
@@ -265,9 +334,7 @@ async fn handle_mpv(
     // (id 5 primary, id 6 secondary) and applied to timing at emit time.
     let mut current_sub_delay: f64 = 0.0;
     let mut current_secondary_sub_delay: f64 = 0.0;
-    let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
-    let mut next_request_id = 10u64;
     let mut line = String::new();
 
     loop {
@@ -279,39 +346,6 @@ async fn handle_mpv(
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-
-        // Handle property responses (request_id encodes: base_id + property_index)
-        if let Some(request_id) = json.get("request_id").and_then(|r| r.as_u64()) {
-            let base_id = request_id / 10 * 10; // Round down to base
-            let prop_idx = (request_id % 10) as usize;
-
-            if let Some(p) = pending.get_mut(&base_id)
-                && let Some(data) = json.get("data").cloned()
-            {
-                p.set_response(prop_idx, data);
-            }
-
-            // Try to complete pending subtitles
-            let completed: Vec<_> = pending
-                .iter()
-                .filter(|(_, p)| p.is_complete())
-                .map(|(id, _)| *id)
-                .collect();
-
-            for base_id in completed {
-                let media_path = current_path.clone().unwrap_or_default();
-                let p = pending.remove(&base_id).unwrap();
-                let delay = match p.track {
-                    SubtitleTrack::Primary => current_sub_delay,
-                    SubtitleTrack::Secondary => current_secondary_sub_delay,
-                };
-                let sub = p.into_subtitle(media_path, current_aid, delay);
-                debug!("[{}:{}] Broadcasting", sub.track.as_str(), sub.id);
-                state.subtitles.write().await.insert(sub.id, sub.clone());
-                let _ = tx.send(SubtitleEvent::New(sub));
-            }
-            continue;
-        }
 
         if json.get("event") != Some(&serde_json::json!("property-change")) {
             continue;
@@ -325,6 +359,7 @@ async fn handle_mpv(
                 let path = path.to_string();
                 if current_path.as_deref() != Some(&path) {
                     current_path = Some(path.clone());
+                    state.recent.lock().await.clear();
                     *state.current_media_path.write().await = Some(path.clone());
                     let _ = tx.send(SubtitleEvent::MediaChanged(path));
                 }
@@ -352,45 +387,62 @@ async fn handle_mpv(
             continue;
         }
 
-        // Subtitle text changed: primary (observer id 1) or secondary (observer id 2).
+        // Subtitle changed: primary (observer id 1) or secondary (observer id 2).
+        // The payload is the `sub-text/ass-full` value: zero or more `Dialogue:`
+        // lines (joined by newlines) describing every event currently on screen.
         let track = match observer_id {
             Some(1) => SubtitleTrack::Primary,
             Some(2) => SubtitleTrack::Secondary,
             _ => continue,
         };
 
-        if let Some(text) = json
-            .get("data")
-            .and_then(|d| d.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        let Some(ass_full) = json.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
+
+        let delay = match track {
+            SubtitleTrack::Primary => current_sub_delay,
+            SubtitleTrack::Secondary => current_secondary_sub_delay,
+        };
+        let media_path = current_path.clone().unwrap_or_default();
+
+        // Each Dialogue line carries its own absolute Start/End, so overlapping
+        // events become independent rows with correct timing.
+        for dialogue in ass_full.lines() {
+            let Some((raw_start, raw_end, style, name, text)) = parse_ass_dialogue(dialogue)
+            else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+
+            // Bucket the raw (pre-delay) start so re-reports collapse but the
+            // same text recurring later stays a distinct row.
+            let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
+            let key = (track, bucket, style.to_string(), name.to_string(), text.clone());
+            if !state.recent.lock().await.insert(key) {
+                continue;
+            }
+
             let subtitle_id = next_subtitle_id;
             next_subtitle_id += 1;
 
-            let base_id = next_request_id;
-            next_request_id += 10;
-
-            // Query the per-track timing properties (start/end); aid and delay
-            // are observed separately and read from their cached values.
-            let (start_prop, end_prop) = track.properties();
-            let cmd = format!(
-                concat!(
-                    "{{\"command\":[\"get_property\",\"{0}\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"{2}\"],\"request_id\":{3}}}\n"
-                ),
-                start_prop,
-                base_id,
-                end_prop,
-                base_id + 1
-            );
-
-            mpv.write_all(cmd.as_bytes()).await?;
-            pending.insert(
-                base_id,
-                PendingSubtitle::new(subtitle_id, text.to_string(), track),
-            );
-            info!("[{}:{}] {}", track.as_str(), subtitle_id, text);
+            let sub = Subtitle {
+                id: subtitle_id,
+                text,
+                sub_start: raw_start + delay,
+                sub_end: raw_end + delay,
+                media_path: media_path.clone(),
+                aid: current_aid,
+                track,
+            };
+            debug!("[{}:{}] Broadcasting", track.as_str(), subtitle_id);
+            info!("[{}:{}] {}", track.as_str(), subtitle_id, sub.text);
+            state.subtitles.write().await.insert(subtitle_id, sub.clone());
+            let _ = tx.send(SubtitleEvent::New(sub));
         }
+        continue;
     }
 }
 
@@ -465,12 +517,20 @@ enum ProtocolRequest {
         offset_end: Option<f64>,
         audio_config: Option<crate::media::AudioConfig>,
     },
+    /// The UI "clear" button: reset the dedup set so already-seen subtitles can
+    /// stream in again (e.g. after clearing the screen and seeking back).
+    Clear,
 }
 
 async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) -> Option<String> {
     let request: ProtocolRequest = serde_json::from_str(text).ok()?;
 
     match request {
+        ProtocolRequest::Clear => {
+            state.recent.lock().await.clear();
+            info!("[client:{}] Cleared subtitle dedup set", client_id);
+            None
+        }
         ProtocolRequest::AudioRange {
             start_id,
             end_id,
@@ -573,5 +633,87 @@ async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) ->
                 .to_string(),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ass_time_parses_h_mm_ss_cc() {
+        assert_eq!(parse_ass_time("0:00:01.50"), Some(1.5));
+        assert_eq!(parse_ass_time("0:00:00.00"), Some(0.0));
+        assert_eq!(parse_ass_time("1:02:03.00"), Some(3723.0));
+        assert_eq!(parse_ass_time(" 0:00:01.50 "), Some(1.5));
+    }
+
+    #[test]
+    fn ass_time_rejects_malformed() {
+        assert_eq!(parse_ass_time("00:01.50"), None); // missing hours field
+        assert_eq!(parse_ass_time("0:00:01:50"), None); // too many fields
+        assert_eq!(parse_ass_time("a:b:c"), None);
+    }
+
+    #[test]
+    fn strip_ass_text_removes_overrides_and_breaks() {
+        assert_eq!(strip_ass_text("{\\i1}Hello{\\i0}"), "Hello");
+        assert_eq!(strip_ass_text("Line1\\NLine2"), "Line1\nLine2");
+        assert_eq!(strip_ass_text("a\\hb"), "a b");
+        assert_eq!(strip_ass_text("plain"), "plain");
+        // backslash not introducing a known escape is kept verbatim
+        assert_eq!(strip_ass_text("a\\xb"), "a\\xb");
+    }
+
+    #[test]
+    fn parse_dialogue_extracts_fields() {
+        let line = "Dialogue: 0,0:00:01.00,0:00:03.50,Default,Alice,0,0,0,,{\\i1}Hi{\\i0} there";
+        let (start, end, style, name, text) = parse_ass_dialogue(line).unwrap();
+        assert_eq!(start, 1.0);
+        assert_eq!(end, 3.5);
+        assert_eq!(style, "Default");
+        assert_eq!(name, "Alice");
+        assert_eq!(text, "Hi there");
+    }
+
+    #[test]
+    fn parse_dialogue_handles_srt_converted_and_commas_in_text() {
+        // SRT converted by mpv: single Default style, empty Name, plain text.
+        let line = "Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Wait, stop!";
+        let (start, end, style, name, text) = parse_ass_dialogue(line).unwrap();
+        assert_eq!((start, end), (5.0, 7.0));
+        assert_eq!(style, "Default");
+        assert_eq!(name, "");
+        assert_eq!(text, "Wait, stop!"); // comma in the Text field is preserved
+    }
+
+    #[test]
+    fn parse_dialogue_rejects_non_dialogue() {
+        assert!(parse_ass_dialogue("Comment: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,x").is_none());
+        assert!(parse_ass_dialogue("[Script Info]").is_none());
+    }
+
+    fn key(text: &str) -> SubtitleKey {
+        (SubtitleTrack::Primary, 0, "Default".to_string(), String::new(), text.to_string())
+    }
+
+    #[test]
+    fn recent_subtitles_dedups_repeats() {
+        let mut recent = RecentSubtitles::new(4);
+        assert!(recent.insert(key("a"))); // first sighting -> emit
+        assert!(!recent.insert(key("a"))); // re-report -> drop
+        assert!(recent.insert(key("b")));
+        recent.clear();
+        assert!(recent.insert(key("a"))); // cleared -> emit again
+    }
+
+    #[test]
+    fn recent_subtitles_evicts_oldest_past_cap() {
+        let mut recent = RecentSubtitles::new(2);
+        recent.insert(key("a"));
+        recent.insert(key("b"));
+        recent.insert(key("c")); // evicts "a"
+        assert!(recent.insert(key("a"))); // "a" no longer remembered -> emit
+        assert!(!recent.insert(key("c"))); // "c" still within window -> drop
     }
 }
