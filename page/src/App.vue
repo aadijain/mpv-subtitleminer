@@ -39,6 +39,7 @@
       sentenceCleanRegexEnabled: false,
       secondaryCleanRegex: '\\(.*?\\)',
       secondaryCleanRegexEnabled: false,
+      showSecondaryColumn: true,
       timelineZoom: 80,
     },
     media: {
@@ -1099,11 +1100,36 @@
 
     <main class="main">
       <div v-if="messages.length === 0" class="empty">Waiting for subtitles...</div>
-      <div v-else class="timeline">
+      <div
+        v-else
+        class="timeline"
+        :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }"
+      >
         <div class="tl-head">
           <div class="tl-head-gutter">time</div>
-          <div class="tl-head-col">Primary</div>
-          <div class="tl-head-col">Secondary</div>
+          <div class="tl-head-col primary">
+            <span>Primary</span>
+            <button
+              v-if="!settings.display.showSecondaryColumn"
+              class="tl-head-toggle"
+              type="button"
+              title="Show secondary column"
+              @click="settings.display.showSecondaryColumn = true"
+            >
+              + Secondary
+            </button>
+          </div>
+          <div class="tl-head-col secondary">
+            <span>Secondary</span>
+            <button
+              class="tl-head-toggle"
+              type="button"
+              title="Hide secondary column"
+              @click="settings.display.showSecondaryColumn = false"
+            >
+              Hide
+            </button>
+          </div>
         </div>
 
         <div class="tl-body" :style="{ height: `${timelineHeight}px` }">
@@ -1933,11 +1959,35 @@
 
   .tl-head-col {
     flex: 1;
-    padding: 9px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 5px 10px 5px 14px;
   }
 
   .tl-head-col + .tl-head-col {
     border-left: 1px solid #252b34;
+  }
+
+  .tl-head-toggle {
+    border: 1px solid #2f3742;
+    background: #232934;
+    color: #a7b4c7;
+    font: inherit;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    padding: 3px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .tl-head-toggle:hover {
+    background: #2e3643;
+    color: #e9edf2;
   }
 
   .tl-body {
@@ -1986,6 +2036,18 @@
   .tl-lane.secondary {
     left: calc(56px + (100% - 56px) / 2);
     right: 0;
+  }
+
+  /* secondary column hidden: primary lane spans the full width */
+  .timeline.hide-secondary .tl-head-col.secondary,
+  .timeline.hide-secondary .tl-lane.secondary {
+    display: none;
+  }
+
+  .timeline.hide-secondary .tl-lane.primary {
+    width: auto;
+    right: 0;
+    border-right: none;
   }
 
   .tl-block {
