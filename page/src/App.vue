@@ -1,6 +1,6 @@
 <script setup lang="ts">
   import MediaConfiguration from './components/MediaConfiguration.vue'
-  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
   import { useToast } from './composables/useToast'
   import { useWebSocket } from './composables/useWebSocket'
   import * as anki from './services/ankiConnect'
@@ -223,9 +223,12 @@
     showSettings.value = false
   }
 
+  type SubtitleTrack = 'primary' | 'secondary'
+
   interface SubtitleMessage {
     id: number
     subtitle: string
+    track: SubtitleTrack
     time_pos: number
     sub_start: number
     sub_end: number
@@ -237,15 +240,69 @@
 
   const messages = ref<SubtitleMessage[]>([])
   const bottomRef = ref<HTMLElement | null>(null)
-  const hoveredThumbnailUid = ref<string | null>(null)
   const loadingMedia = ref<Record<string, boolean>>({})
+  // Floating screenshot preview: anchored to the hovered block's screenshot button. Rendered
+  // via Teleport so it isn't clipped by the block's overflow. Shows once the thumbnail loads.
+  const thumbHover = ref<{ uid: string; top: number; left: number } | null>(null)
+  // Two independent selections, one per column. `selectedMessages` (primary) drives the
+  // existing Anki/media flow; `selectedSecondary` is display/selection only for now.
   const selectedMessages = ref<Set<string>>(new Set())
+  const selectedSecondary = ref<Set<string>>(new Set())
+
+  // Split the single message stream into two time-ordered columns by track.
+  const sortByTime = (a: SubtitleMessage, b: SubtitleMessage) =>
+    a.sub_start - b.sub_start || a.id - b.id
+  const primaryMessages = computed(() =>
+    messages.value.filter((m) => m.track === 'primary').sort(sortByTime),
+  )
+  const secondaryMessages = computed(() =>
+    messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
+  )
+
+  // Proportional vertical timeline: a shared time axis both columns are positioned against.
+  const PPS_MIN = 30
+  const PPS_MAX = 240
+  const pixelsPerSecond = ref(80)
+  const zoomIn = () => (pixelsPerSecond.value = Math.min(PPS_MAX, pixelsPerSecond.value + 20))
+  const zoomOut = () => (pixelsPerSecond.value = Math.max(PPS_MIN, pixelsPerSecond.value - 20))
+
+  const timelineBounds = computed(() => {
+    if (messages.value.length === 0) return { start: 0, end: 1 }
+    let start = Infinity
+    let end = -Infinity
+    for (const m of messages.value) {
+      if (m.sub_start < start) start = m.sub_start
+      if (m.sub_end > end) end = m.sub_end
+    }
+    return { start: Math.max(0, Math.floor(start)), end: Math.ceil(end) }
+  })
+  const timelineHeight = computed(
+    () => (timelineBounds.value.end - timelineBounds.value.start) * pixelsPerSecond.value,
+  )
+  const tickStep = computed(() => {
+    const target = 64 / pixelsPerSecond.value // aim for ~64px between gutter ticks
+    return [1, 2, 5, 10, 15, 20, 30, 60, 120, 300].find((s) => s >= target) ?? 600
+  })
+  const ticks = computed(() => {
+    const { start, end } = timelineBounds.value
+    const step = tickStep.value
+    const out: number[] = []
+    for (let t = Math.ceil(start / step) * step; t <= end; t += step) out.push(t)
+    return out
+  })
+  const yFor = (t: number) => (t - timelineBounds.value.start) * pixelsPerSecond.value
+  const blockStyle = (m: SubtitleMessage) => ({
+    top: `${yFor(m.sub_start)}px`,
+    height: `${Math.max(40, (m.sub_end - m.sub_start) * pixelsPerSecond.value)}px`,
+  })
+  const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
 
   // Wipes the displayed subtitles and the current selection. Does NOT touch the page title -
   // callers that need to retitle (e.g. a media change) do so themselves.
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+    selectedSecondary.value = new Set()
   }
 
   function titleFromMediaPath(mediaPath: string): string {
@@ -426,8 +483,18 @@
       return null
     }
     const normalizedTimePos = time_pos ?? sub_start
+    const track: SubtitleTrack = d.track === 'secondary' ? 'secondary' : 'primary'
     const uid = `${port}-${id}`
-    return { id, subtitle, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid }
+    return {
+      id,
+      subtitle,
+      track,
+      time_pos: normalizedTimePos,
+      sub_start,
+      sub_end,
+      sourcePort: port,
+      uid,
+    }
   }
 
   function parseMediaMessage(d: JsonObject): { id: number; data: string } | null {
@@ -448,46 +515,50 @@
   }
 
   const isSelected = (uid: string) => selectedMessages.value.has(uid)
+  const isSelectedSecondary = (uid: string) => selectedSecondary.value.has(uid)
 
-  const toggleSelection = (msg: SubtitleMessage, index: number) => {
-    const id = msg.uid
-    const selected = selectedMessages.value
-
-    if (selected.has(id)) {
-      const selectedIndices = Array.from(selected)
-        .map((selId) => messages.value.findIndex((m) => m.uid === selId))
+  // Sequential/contiguous selection within a single column's time-ordered list: clicking
+  // grows or shrinks one run from either end (mirrors the original single-list behaviour).
+  const toggleInColumn = (
+    target: Ref<Set<string>>,
+    list: SubtitleMessage[],
+    msg: SubtitleMessage,
+  ) => {
+    const index = list.findIndex((m) => m.uid === msg.uid)
+    if (index === -1) return
+    const selected = new Set(target.value)
+    const selectedIndices = () =>
+      Array.from(selected)
+        .map((uid) => list.findIndex((m) => m.uid === uid))
         .filter((i) => i !== -1)
         .sort((a, b) => a - b)
 
-      if (index === selectedIndices[0] || index === selectedIndices[selectedIndices.length - 1]) {
-        selected.delete(id)
-      }
+    if (selected.has(msg.uid)) {
+      const idx = selectedIndices()
+      if (index === idx[0] || index === idx[idx.length - 1]) selected.delete(msg.uid)
+    } else if (selected.size === 0) {
+      selected.add(msg.uid)
     } else {
-      if (selected.size === 0) {
-        selected.add(id)
-      } else {
-        const selectedIndices = Array.from(selected)
-          .map((selId) => messages.value.findIndex((m) => m.uid === selId))
-          .filter((i) => i !== -1)
-          .sort((a, b) => a - b)
-
-        const minIdx = selectedIndices[0] ?? index
-        const maxIdx = selectedIndices[selectedIndices.length - 1] ?? index
-
-        if (index === minIdx - 1 || index === maxIdx + 1) {
-          selected.add(id)
-        }
-      }
+      const idx = selectedIndices()
+      const minIdx = idx[0] ?? index
+      const maxIdx = idx[idx.length - 1] ?? index
+      if (index === minIdx - 1 || index === maxIdx + 1) selected.add(msg.uid)
     }
-    selectedMessages.value = new Set(selected)
+    target.value = selected
   }
+
+  const togglePrimary = (msg: SubtitleMessage) =>
+    toggleInColumn(selectedMessages, primaryMessages.value, msg)
+  const toggleSecondary = (msg: SubtitleMessage) =>
+    toggleInColumn(selectedSecondary, secondaryMessages.value, msg)
 
   const clearSelection = () => {
     selectedMessages.value = new Set()
+    selectedSecondary.value = new Set()
   }
 
   const getSelectedMessages = (): SubtitleMessage[] => {
-    return messages.value.filter((m) => selectedMessages.value.has(m.uid))
+    return primaryMessages.value.filter((m) => selectedMessages.value.has(m.uid))
   }
 
   const getSelectionRange = (): { first: SubtitleMessage; last: SubtitleMessage } | null => {
@@ -495,8 +566,8 @@
     if (selected.length === 0) return null
 
     const sorted = selected.sort((a, b) => {
-      const aIdx = messages.value.findIndex((m) => m.uid === a.uid)
-      const bIdx = messages.value.findIndex((m) => m.uid === b.uid)
+      const aIdx = primaryMessages.value.findIndex((m) => m.uid === a.uid)
+      const bIdx = primaryMessages.value.findIndex((m) => m.uid === b.uid)
       return aIdx - bIdx
     })
 
@@ -613,6 +684,37 @@
     }
     loadingMedia.value[key] = true
   }
+
+  // Click the screenshot button to request it; hovering shows a floating preview once loaded.
+  const onThumbButtonClick = (msg: SubtitleMessage, e: MouseEvent) => {
+    requestThumbnail(msg)
+    setThumbHover(msg, e)
+  }
+
+  const setThumbHover = (msg: SubtitleMessage, e: MouseEvent) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    thumbHover.value = {
+      uid: msg.uid,
+      top: Math.min(rect.bottom + 8, window.innerHeight - 256),
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - 432)),
+    }
+  }
+
+  const clearThumbHover = (uid: string) => {
+    if (thumbHover.value?.uid === uid) thumbHover.value = null
+  }
+
+  const thumbPreview = computed(() => {
+    const hover = thumbHover.value
+    if (!hover) return null
+    const msg = messages.value.find((m) => m.uid === hover.uid)
+    if (!msg?.thumbnail) return null
+    return {
+      src: `data:image/${settings.value.media.imageFormat};base64,${msg.thumbnail}`,
+      top: hover.top,
+      left: hover.left,
+    }
+  })
 
   const requestAudio = (msg: SubtitleMessage) => {
     if (ws.status.value !== 'connected') return
@@ -959,6 +1061,25 @@
         </span>
       </div>
       <div class="controls">
+        <div v-if="messages.length > 0" class="zoom-group" title="Timeline zoom">
+          <button
+            class="btn ghost sq"
+            type="button"
+            :disabled="pixelsPerSecond <= PPS_MIN"
+            @click="zoomOut"
+          >
+            −
+          </button>
+          <span class="zoom-label">{{ pixelsPerSecond }} px/s</span>
+          <button
+            class="btn ghost sq"
+            type="button"
+            :disabled="pixelsPerSecond >= PPS_MAX"
+            @click="zoomIn"
+          >
+            +
+          </button>
+        </div>
         <button class="btn" type="button" @click="ws.connect">Connect</button>
         <button class="btn ghost" type="button" @click="ws.disconnect">Disconnect</button>
         <button class="btn ghost" type="button" @click="clearMessages">Clear</button>
@@ -968,118 +1089,135 @@
 
     <main class="main">
       <div v-if="messages.length === 0" class="empty">Waiting for subtitles...</div>
-      <ul v-else class="messages">
-        <li
-          v-for="(message, index) in messages"
-          :key="message.uid"
-          class="message-row"
-          :class="{ selected: isSelected(message.uid) }"
-          @click="toggleSelection(message, index)"
-        >
-          <span
-            class="subtitle-text"
-            :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
-            >{{ cleanSentence(message.subtitle) }}</span
-          >
-          <div class="actions">
-            <div class="thumb-action">
-              <button
-                class="icon-btn"
-                :class="{
-                  loading: loadingMedia[`thumb-${message.uid}`],
-                  active: message.thumbnail,
-                }"
-                title="Screenshot"
-                @click.stop="requestThumbnail(message)"
-                @mouseenter="hoveredThumbnailUid = message.uid"
-                @mouseleave="
-                  () => {
-                    if (hoveredThumbnailUid === message.uid) {
-                      hoveredThumbnailUid = null
-                    }
-                  }
-                "
+      <div v-else class="timeline">
+        <div class="tl-head">
+          <div class="tl-head-gutter">time</div>
+          <div class="tl-head-col">Primary</div>
+          <div class="tl-head-col">Secondary</div>
+        </div>
+
+        <div class="tl-body" :style="{ height: `${timelineHeight}px` }">
+          <div class="tl-gutter">
+            <div v-for="t in ticks" :key="t" class="tl-tick" :style="{ top: `${yFor(t)}px` }">
+              <span class="tl-tick-label">{{ fmtTime(t) }}</span>
+            </div>
+          </div>
+
+          <div class="tl-lane primary">
+            <div
+              v-for="message in primaryMessages"
+              :key="message.uid"
+              class="tl-block"
+              :class="{ sel: isSelected(message.uid) }"
+              :style="blockStyle(message)"
+              @click="togglePrimary(message)"
+            >
+              <span
+                class="tl-text"
+                :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
+                >{{ cleanSentence(message.subtitle) }}</span
               >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
+              <div class="tl-actions">
+                <button
+                  class="icon-btn compact"
+                  :class="{
+                    loading: loadingMedia[`thumb-${message.uid}`],
+                    active: message.thumbnail,
+                  }"
+                  title="Screenshot (hover to preview)"
+                  @click.stop="onThumbButtonClick(message, $event)"
+                  @mouseenter="setThumbHover(message, $event)"
+                  @mouseleave="clearThumbHover(message.uid)"
                 >
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                  <circle cx="8.5" cy="8.5" r="1.5" />
-                  <polyline points="21 15 16 10 5 21" />
-                </svg>
-              </button>
-              <div
-                v-if="hoveredThumbnailUid === message.uid && message.thumbnail"
-                class="thumb-preview"
-              >
-                <img
-                  :src="`data:image/${settings.media.imageFormat};base64,${message.thumbnail}`"
-                  alt="Thumbnail"
-                />
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <polyline points="21 15 16 10 5 21" />
+                  </svg>
+                </button>
+                <button
+                  class="icon-btn compact"
+                  :class="{ loading: loadingMedia[`audio-${message.uid}`], active: message.audio }"
+                  title="Play audio"
+                  @click.stop="requestAudio(message)"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                </button>
+                <button
+                  v-if="selectionRangeAnchorUid === message.uid"
+                  class="icon-btn compact"
+                  :class="{ loading: selectionAudioLoading }"
+                  :disabled="selectionAudioLoading"
+                  title="Play selected range"
+                  @click.stop="requestSelectionAudioRange"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                </button>
               </div>
             </div>
-            <button
-              class="icon-btn"
-              :class="{ loading: loadingMedia[`audio-${message.uid}`], active: message.audio }"
-              title="Play audio"
-              @click.stop="requestAudio(message)"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-              </svg>
-            </button>
           </div>
-          <button
-            v-if="selectionRangeAnchorUid === message.uid"
-            class="icon-btn range-audio-btn"
-            :class="{ loading: selectionAudioLoading }"
-            :disabled="selectionAudioLoading"
-            title="Play selected range"
-            @click.stop="requestSelectionAudioRange"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
+
+          <div class="tl-lane secondary">
+            <div
+              v-for="message in secondaryMessages"
+              :key="message.uid"
+              class="tl-block secondary"
+              :class="{ sel: isSelectedSecondary(message.uid) }"
+              :style="blockStyle(message)"
+              @click="toggleSecondary(message)"
             >
-              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-            </svg>
-          </button>
-        </li>
-      </ul>
-      <div ref="bottomRef" class="bottom-anchor" aria-hidden="true"></div>
+              <span class="tl-text">{{ cleanSentence(message.subtitle) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div ref="bottomRef" class="bottom-anchor" aria-hidden="true"></div>
+      </div>
     </main>
 
     <div
       ref="selectionBarRef"
       class="selection-bar"
-      :class="{ inactive: selectedMessages.size === 0 }"
+      :class="{ inactive: selectedMessages.size === 0 && selectedSecondary.size === 0 }"
     >
       <div class="selection-left">
-        <template v-if="selectedMessages.size > 0">
-          <span class="selection-count">{{ selectedMessages.size }} selected</span>
+        <template v-if="selectedMessages.size > 0 || selectedSecondary.size > 0">
+          <span class="selection-count">
+            {{ selectedMessages.size }} primary
+            <span class="selection-sub">· {{ selectedSecondary.size }} secondary</span>
+          </span>
           <span v-if="loadingTargetCard" class="target-card loading">Loading card...</span>
           <span v-else-if="targetCardPreview" class="target-card" title="Target card">
             → {{ targetCardPreview }}
@@ -1098,13 +1236,23 @@
         </button>
         <button
           class="selection-btn clear-btn"
-          :disabled="selectedMessages.size === 0"
+          :disabled="selectedMessages.size === 0 && selectedSecondary.size === 0"
           @click="clearSelection"
         >
           ✕ Clear
         </button>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="thumbPreview"
+        class="thumb-preview-float"
+        :style="{ top: `${thumbPreview.top}px`, left: `${thumbPreview.left}px` }"
+      >
+        <img :src="thumbPreview.src" alt="Screenshot preview" />
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div v-if="showSettings" class="modal-overlay" @click.self="cancelSettings">
@@ -1441,7 +1589,8 @@
   }
 
   .app {
-    min-height: 100vh;
+    height: 100vh;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }
@@ -1641,72 +1790,226 @@
 
   .main {
     flex: 1;
-    padding: 16px;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 16px;
     padding-bottom: calc(var(--selection-bar-height, 72px) + 16px);
   }
 
   .empty {
     color: #6c7687;
-    padding: 0 8px;
+    padding: 16px 8px;
     font-size: 1.05em;
   }
 
-  .messages {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  .bottom-anchor {
-    scroll-margin-bottom: calc(var(--selection-bar-height, 72px) + 16px);
-  }
-
-  .message-row {
+  /* ── two-column vertical timeline ─────────────────────────────── */
+  .timeline {
     position: relative;
+  }
+
+  .tl-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 14px 0;
-    border-bottom: 1px solid #202630;
+    background: #1b1f26;
+    border-bottom: 1px solid #252b34;
+    font-size: 0.76em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #7c8aa1;
+  }
+
+  .tl-head-gutter {
+    flex: none;
+    width: 56px;
+    padding: 9px 0 9px 10px;
+  }
+
+  .tl-head-col {
+    flex: 1;
+    padding: 9px 14px;
+  }
+
+  .tl-head-col + .tl-head-col {
+    border-left: 1px solid #252b34;
+  }
+
+  .tl-body {
+    position: relative;
+  }
+
+  .tl-gutter {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 56px;
+    border-right: 1px solid #202630;
+  }
+
+  .tl-tick {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-top: 1px solid #1c222b;
+  }
+
+  .tl-tick-label {
+    position: absolute;
+    top: -0.62em;
+    left: 8px;
+    padding-right: 4px;
+    background: #14171c;
+    color: #6c7687;
+    font-size: 0.72em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tl-lane {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+  }
+
+  .tl-lane.primary {
+    left: 56px;
+    width: calc((100% - 56px) / 2);
+    border-right: 1px solid #202630;
+  }
+
+  .tl-lane.secondary {
+    left: calc(56px + (100% - 56px) / 2);
+    right: 0;
+  }
+
+  .tl-block {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 7px 9px;
+    border: 1px solid #232a33;
+    border-radius: 8px;
+    background: #1b1f26;
     cursor: pointer;
-    transition: background-color 0.15s ease;
+    overflow: hidden;
+    transition:
+      background 0.15s ease,
+      border-color 0.15s ease;
   }
 
-  .message-row:hover {
-    background: rgba(255, 255, 255, 0.04);
+  .tl-block:hover {
+    background: #20262f;
   }
 
-  .message-row.selected {
+  .tl-block.sel {
     background: rgba(90, 154, 202, 0.15);
-    border-left: 3px solid #5a9aca;
-    padding-left: 13px;
+    border-color: #5a9aca;
   }
 
-  .subtitle-text {
-    flex: 0 1 auto;
+  .tl-block.sel::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: #5a9aca;
+  }
+
+  .tl-block.secondary.sel {
+    background: rgba(61, 220, 151, 0.13);
+    border-color: #3ddc97;
+  }
+
+  .tl-block.secondary.sel::before {
+    background: #3ddc97;
+  }
+
+  .tl-text {
+    flex: 1 1 auto;
     min-width: 0;
-    font-size: 1.1em;
-    line-height: 1.6;
+    line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
   }
 
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
+  .tl-block.secondary .tl-text {
+    font-size: 0.95em;
+    color: #c5cedd;
   }
 
-  .thumb-action {
-    position: relative;
-    display: flex;
-    align-items: center;
+  .tl-actions {
+    display: none;
+    flex: none;
+    gap: 2px;
   }
 
-  .range-audio-btn {
-    margin-left: auto;
-    margin-right: 8px;
+  .tl-block:hover .tl-actions,
+  .tl-block.sel .tl-actions {
+    display: flex;
+  }
+
+  .icon-btn.compact {
+    width: 26px;
+    height: 26px;
+    padding: 4px;
+    border-radius: 6px;
+  }
+
+  .icon-btn.compact svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .zoom-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-right: 4px;
+  }
+
+  .zoom-label {
+    min-width: 52px;
+    text-align: center;
+    font-size: 0.8em;
+    color: #7c8aa1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .btn.sq {
+    padding: 8px 10px;
+  }
+
+  .selection-sub {
+    color: #76849a;
+    font-weight: 400;
+    font-size: 0.9em;
+  }
+
+  .thumb-preview-float {
+    position: fixed;
+    z-index: 40;
+    background: #0f1318;
+    border: 1px solid #1f252e;
+    border-radius: 8px;
+    padding: 8px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+  }
+
+  .thumb-preview-float img {
+    display: block;
+    max-width: 420px;
+    max-height: 240px;
+    border-radius: 4px;
+  }
+
+  .bottom-anchor {
+    scroll-margin-bottom: calc(var(--selection-bar-height, 72px) + 16px);
   }
 
   .icon-btn:disabled {
@@ -1745,27 +2048,6 @@
   .icon-btn svg {
     width: 22px;
     height: 22px;
-  }
-
-  .thumb-preview {
-    position: absolute;
-    top: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 10;
-    background: #0f1318;
-    border: 1px solid #1f252e;
-    border-radius: 8px;
-    padding: 8px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
-    pointer-events: none;
-  }
-
-  .thumb-preview img {
-    max-width: 420px;
-    max-height: 240px;
-    display: block;
-    border-radius: 4px;
   }
 
   .selection-bar {
