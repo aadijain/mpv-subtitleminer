@@ -42,6 +42,7 @@ export interface DisplaySettings {
   secondaryCleanRegexEnabled: boolean
   showSecondaryColumn: boolean
   timelineZoom: number
+  primaryColumnFraction: number
 }
 
 export interface Settings {
