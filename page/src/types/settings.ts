@@ -40,6 +40,7 @@ export interface DisplaySettings {
   sentenceCleanRegexEnabled: boolean
   secondaryCleanRegex: string
   secondaryCleanRegexEnabled: boolean
+  timelineZoom: number
 }
 
 export interface Settings {

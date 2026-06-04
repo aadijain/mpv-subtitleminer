@@ -39,6 +39,7 @@
       sentenceCleanRegexEnabled: false,
       secondaryCleanRegex: '\\(.*?\\)',
       secondaryCleanRegexEnabled: false,
+      timelineZoom: 80,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -265,11 +266,10 @@
   )
 
   // Proportional vertical timeline: a shared time axis both columns are positioned against.
+  // Zoom (px per second) is configured in Settings → Display.
   const PPS_MIN = 30
   const PPS_MAX = 240
-  const pixelsPerSecond = ref(80)
-  const zoomIn = () => (pixelsPerSecond.value = Math.min(PPS_MAX, pixelsPerSecond.value + 20))
-  const zoomOut = () => (pixelsPerSecond.value = Math.max(PPS_MIN, pixelsPerSecond.value - 20))
+  const pixelsPerSecond = computed(() => settings.value.display.timelineZoom)
 
   const timelineBounds = computed(() => {
     if (messages.value.length === 0) return { start: 0, end: 1 }
@@ -1090,25 +1090,6 @@
         </span>
       </div>
       <div class="controls">
-        <div v-if="messages.length > 0" class="zoom-group" title="Timeline zoom">
-          <button
-            class="btn ghost sq"
-            type="button"
-            :disabled="pixelsPerSecond <= PPS_MIN"
-            @click="zoomOut"
-          >
-            −
-          </button>
-          <span class="zoom-label">{{ pixelsPerSecond }} px/s</span>
-          <button
-            class="btn ghost sq"
-            type="button"
-            :disabled="pixelsPerSecond >= PPS_MAX"
-            @click="zoomIn"
-          >
-            +
-          </button>
-        </div>
         <button class="btn" type="button" @click="ws.connect">Connect</button>
         <button class="btn ghost" type="button" @click="ws.disconnect">Disconnect</button>
         <button class="btn ghost" type="button" @click="clearMessages">Clear</button>
@@ -1525,6 +1506,25 @@
                   <div class="range-labels">
                     <span>70%</span>
                     <span>200%</span>
+                  </div>
+                </label>
+                <label class="form-group">
+                  <span>Timeline zoom ({{ localDisplay.timelineZoom }} px/s)</span>
+                  <input
+                    type="range"
+                    :min="PPS_MIN"
+                    :max="PPS_MAX"
+                    step="5"
+                    :value="localDisplay.timelineZoom"
+                    class="range-input"
+                    @input="
+                      (e) =>
+                        (localDisplay.timelineZoom = parseInt((e.target as HTMLInputElement).value))
+                    "
+                  />
+                  <div class="range-labels">
+                    <span>{{ PPS_MIN }} px/s</span>
+                    <span>{{ PPS_MAX }} px/s</span>
                   </div>
                 </label>
               </div>
@@ -2067,25 +2067,6 @@
   .icon-btn.compact svg {
     width: 16px;
     height: 16px;
-  }
-
-  .zoom-group {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    margin-right: 4px;
-  }
-
-  .zoom-label {
-    min-width: 52px;
-    text-align: center;
-    font-size: 0.8em;
-    color: #7c8aa1;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .btn.sq {
-    padding: 8px 10px;
   }
 
   .selection-sub {
