@@ -267,6 +267,51 @@
     messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
   )
 
+  // Google-Calendar-style overlap layout: split a lane into side-by-side columns for
+  // overlapping events. Walk the time-sorted list into clusters (maximal runs that overlap),
+  // assign each block the leftmost free column within its cluster (first-fit), and tag every
+  // block with its column index + the cluster's total column count. CSS turns {col, cols} into
+  // an equal-width slice of the lane. cols === 1 means no overlap (full width).
+  interface BlockSlot {
+    col: number
+    cols: number
+  }
+  const layoutLane = (list: SubtitleMessage[]) => {
+    const out = new Map<string, BlockSlot>()
+    let cluster: SubtitleMessage[] = []
+    let clusterEnd = -Infinity
+    const flush = () => {
+      if (cluster.length === 0) return
+      const colEnds: number[] = [] // last sub_end placed in each column
+      const colOf = new Map<string, number>()
+      for (const m of cluster) {
+        let c = 0
+        while (c < colEnds.length && (colEnds[c] ?? -Infinity) > m.sub_start) c++
+        colEnds[c] = m.sub_end
+        colOf.set(m.uid, c)
+      }
+      const cols = colEnds.length
+      for (const m of cluster) out.set(m.uid, { col: colOf.get(m.uid) ?? 0, cols })
+      cluster = []
+      clusterEnd = -Infinity
+    }
+    for (const m of list) {
+      if (cluster.length > 0 && m.sub_start >= clusterEnd) flush()
+      cluster.push(m)
+      clusterEnd = Math.max(clusterEnd, m.sub_end)
+    }
+    flush()
+    return out
+  }
+  const blockLayout = computed(() => {
+    const map = new Map<string, BlockSlot>()
+    for (const [uid, slot] of layoutLane(primaryMessages.value)) map.set(uid, slot)
+    for (const [uid, slot] of layoutLane(secondaryMessages.value)) map.set(uid, slot)
+    return map
+  })
+  const layoutOf = (m: SubtitleMessage): BlockSlot =>
+    blockLayout.value.get(m.uid) ?? { col: 0, cols: 1 }
+
   // Vertical timeline: a shared time axis both columns are positioned against. Time runs at
   // `pixelsPerSecond` (configured in Settings → Display) EXCEPT inside long gaps with no subs
   // in either column, which are capped at MAX_GAP_PX so silence / seek dead-zones don't waste
@@ -381,7 +426,16 @@
 
   const blockStyle = (m: SubtitleMessage) => {
     const top = yFor(m.sub_start)
-    return { top: `${top}px`, '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px` }
+    const { col, cols } = layoutOf(m)
+    const style: Record<string, string> = {
+      top: `${top}px`,
+      '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px`,
+    }
+    if (cols > 1) {
+      style['--col'] = String(col)
+      style['--cols'] = String(cols)
+    }
+    return style
   }
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
 
@@ -1299,7 +1353,7 @@
               v-for="message in primaryMessages"
               :key="message.uid"
               class="tl-block"
-              :class="{ sel: isSelected(message.uid) }"
+              :class="{ sel: isSelected(message.uid), cal: layoutOf(message).cols > 1 }"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
             >
@@ -1385,7 +1439,7 @@
               v-for="message in secondaryMessages"
               :key="message.uid"
               class="tl-block secondary"
-              :class="{ sel: isSelectedSecondary(message.uid) }"
+              :class="{ sel: isSelectedSecondary(message.uid), cal: layoutOf(message).cols > 1 }"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
@@ -2307,11 +2361,23 @@
     overflow: hidden;
     transition:
       background 0.15s ease,
-      border-color 0.15s ease;
+      border-color 0.15s ease,
+      left 0.12s ease,
+      width 0.12s ease;
+  }
+
+  /* Calendar-style overlap: a block in a cluster of `--cols` overlapping events takes the
+     `--col`-th equal-width slice of the lane (16px = the 8px lane margins, 3px = inter-column
+     gap). Setting left+width means the base `right: 8px` is ignored. */
+  .tl-block.cal {
+    left: calc(8px + (100% - 16px) * var(--col, 0) / var(--cols, 1));
+    width: calc((100% - 16px) / var(--cols, 1) - 3px);
   }
 
   .tl-block.sel {
-    background: rgba(90, 154, 202, 0.15);
+    /* opaque equivalent of rgba(90,154,202,0.15) over the #1b1f26 base; a translucent fill
+       lets overlapping (absolutely-positioned) blocks show through and looks transparent */
+    background: #24313f;
     border-color: #5a9aca;
   }
 
@@ -2326,7 +2392,8 @@
   }
 
   .tl-block.secondary.sel {
-    background: rgba(61, 220, 151, 0.13);
+    /* opaque equivalent of rgba(61,220,151,0.13) over the #1b1f26 base */
+    background: #1f3835;
     border-color: #3ddc97;
   }
 
@@ -2344,6 +2411,15 @@
     z-index: 5;
     background: #20262f;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  }
+
+  /* Hovering a calendar-column block expands it to the full lane width and to the front, so a
+     narrow overlap column is comfortably readable. Higher specificity than .tl-block.cal. */
+  .tl-block.cal:hover {
+    left: 8px;
+    right: 8px;
+    width: auto;
+    z-index: 6;
   }
 
   .tl-text {
