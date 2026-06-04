@@ -267,6 +267,75 @@
     messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
   )
 
+  // Google-Calendar-style overlap layout: split a lane into side-by-side columns for
+  // overlapping events. Walk the time-sorted list into clusters (maximal runs that overlap)
+  // and first-fit each block into the leftmost free column. Each column is then sized by how
+  // densely its text fills the available height (characters ÷ duration ≈ text per unit of the
+  // time-proportional block height), so every box comes out roughly full instead of some
+  // cramped and some half-empty. The px/sec zoom factor cancels under normalization, so widths
+  // stay stable across zoom. Returns per-block {left, width} as fractions of the lane's inner
+  // width; only blocks in a multi-column cluster are mapped (a lone block stays full width).
+  interface BlockSlot {
+    left: number // fraction of inner lane width
+    width: number
+  }
+  // Text "fill demand": clamped char count over clamped duration. A wordy-but-brief line wants
+  // a wider column; a sparse-but-long one can stay narrow and still look full.
+  const fillWeight = (m: SubtitleMessage) =>
+    Math.min(80, Math.max(8, m.subtitle.length)) / Math.max(0.8, m.sub_end - m.sub_start)
+  const layoutLane = (list: SubtitleMessage[]) => {
+    const out = new Map<string, BlockSlot>()
+    let cluster: SubtitleMessage[] = []
+    let clusterEnd = -Infinity
+    const flush = () => {
+      if (cluster.length === 0) return
+      const colEnds: number[] = [] // last sub_end placed in each column
+      const colOf = new Map<string, number>()
+      for (const m of cluster) {
+        let c = 0
+        while (c < colEnds.length && (colEnds[c] ?? -Infinity) > m.sub_start) c++
+        colEnds[c] = m.sub_end
+        colOf.set(m.uid, c)
+      }
+      const cols = colEnds.length
+      if (cols > 1) {
+        // Each column's weight = the most text any of its blocks carries.
+        const weight = Array.from({ length: cols }, () => 0)
+        for (const m of cluster) {
+          const c = colOf.get(m.uid) ?? 0
+          weight[c] = Math.max(weight[c] ?? 0, fillWeight(m))
+        }
+        const total = weight.reduce((a, b) => a + b, 0) || cols
+        const leftFrac: number[] = []
+        let acc = 0
+        for (let c = 0; c < cols; c++) {
+          leftFrac[c] = acc / total
+          acc += weight[c] ?? 0
+        }
+        for (const m of cluster) {
+          const c = colOf.get(m.uid) ?? 0
+          out.set(m.uid, { left: leftFrac[c] ?? 0, width: (weight[c] ?? 0) / total })
+        }
+      }
+      cluster = []
+      clusterEnd = -Infinity
+    }
+    for (const m of list) {
+      if (cluster.length > 0 && m.sub_start >= clusterEnd) flush()
+      cluster.push(m)
+      clusterEnd = Math.max(clusterEnd, m.sub_end)
+    }
+    flush()
+    return out
+  }
+  const blockLayout = computed(() => {
+    const map = new Map<string, BlockSlot>()
+    for (const [uid, slot] of layoutLane(primaryMessages.value)) map.set(uid, slot)
+    for (const [uid, slot] of layoutLane(secondaryMessages.value)) map.set(uid, slot)
+    return map
+  })
+  const slotOf = (m: SubtitleMessage) => blockLayout.value.get(m.uid)
+
   // Vertical timeline: a shared time axis both columns are positioned against. Time runs at
   // `pixelsPerSecond` (configured in Settings → Display) EXCEPT inside long gaps with no subs
   // in either column, which are capped at MAX_GAP_PX so silence / seek dead-zones don't waste
@@ -381,7 +450,16 @@
 
   const blockStyle = (m: SubtitleMessage) => {
     const top = yFor(m.sub_start)
-    return { top: `${top}px`, '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px` }
+    const slot = slotOf(m)
+    const style: Record<string, string> = {
+      top: `${top}px`,
+      '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px`,
+    }
+    if (slot) {
+      style['--left'] = String(slot.left)
+      style['--width'] = String(slot.width)
+    }
+    return style
   }
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
 
@@ -666,40 +744,19 @@
   const isSelected = (uid: string) => selectedMessages.value.has(uid)
   const isSelectedSecondary = (uid: string) => selectedSecondary.value.has(uid)
 
-  // Sequential/contiguous selection within a single column's time-ordered list: clicking
-  // grows or shrinks one run from either end (mirrors the original single-list behaviour).
-  const toggleInColumn = (
-    target: Ref<Set<string>>,
-    list: SubtitleMessage[],
-    msg: SubtitleMessage,
-  ) => {
-    const index = list.findIndex((m) => m.uid === msg.uid)
-    if (index === -1) return
+  // Free selection within a column: clicking toggles a block in or out, with no contiguity
+  // requirement. Audio still spans the earliest selected start to the latest selected end as
+  // one continuous clip (see getSelectionRange + requestAudioRange), so non-adjacent picks
+  // include the gap between them rather than concatenating per-block clips.
+  const toggleInColumn = (target: Ref<Set<string>>, msg: SubtitleMessage) => {
     const selected = new Set(target.value)
-    const selectedIndices = () =>
-      Array.from(selected)
-        .map((uid) => list.findIndex((m) => m.uid === uid))
-        .filter((i) => i !== -1)
-        .sort((a, b) => a - b)
-
-    if (selected.has(msg.uid)) {
-      const idx = selectedIndices()
-      if (index === idx[0] || index === idx[idx.length - 1]) selected.delete(msg.uid)
-    } else if (selected.size === 0) {
-      selected.add(msg.uid)
-    } else {
-      const idx = selectedIndices()
-      const minIdx = idx[0] ?? index
-      const maxIdx = idx[idx.length - 1] ?? index
-      if (index === minIdx - 1 || index === maxIdx + 1) selected.add(msg.uid)
-    }
+    if (selected.has(msg.uid)) selected.delete(msg.uid)
+    else selected.add(msg.uid)
     target.value = selected
   }
 
-  const togglePrimary = (msg: SubtitleMessage) =>
-    toggleInColumn(selectedMessages, primaryMessages.value, msg)
-  const toggleSecondary = (msg: SubtitleMessage) =>
-    toggleInColumn(selectedSecondary, secondaryMessages.value, msg)
+  const togglePrimary = (msg: SubtitleMessage) => toggleInColumn(selectedMessages, msg)
+  const toggleSecondary = (msg: SubtitleMessage) => toggleInColumn(selectedSecondary, msg)
 
   const clearSelection = () => {
     selectedMessages.value = new Set()
@@ -1299,7 +1356,7 @@
               v-for="message in primaryMessages"
               :key="message.uid"
               class="tl-block"
-              :class="{ sel: isSelected(message.uid) }"
+              :class="{ sel: isSelected(message.uid), cal: !!slotOf(message) }"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
             >
@@ -1385,7 +1442,7 @@
               v-for="message in secondaryMessages"
               :key="message.uid"
               class="tl-block secondary"
-              :class="{ sel: isSelectedSecondary(message.uid) }"
+              :class="{ sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) }"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
@@ -2307,11 +2364,23 @@
     overflow: hidden;
     transition:
       background 0.15s ease,
-      border-color 0.15s ease;
+      border-color 0.15s ease,
+      left 0.12s ease,
+      width 0.12s ease;
+  }
+
+  /* Calendar-style overlap: --left/--width are fractions of the lane's inner width (the
+     column was sized by its text amount). 16px = the 8px lane margins, 3px = inter-column gap.
+     Setting left+width means base `right: 8px` is ignored. */
+  .tl-block.cal {
+    left: calc(8px + (100% - 16px) * var(--left, 0));
+    width: calc((100% - 16px) * var(--width, 1) - 3px);
   }
 
   .tl-block.sel {
-    background: rgba(90, 154, 202, 0.15);
+    /* opaque equivalent of rgba(90,154,202,0.15) over the #1b1f26 base; a translucent fill
+       lets overlapping (absolutely-positioned) blocks show through and looks transparent */
+    background: #24313f;
     border-color: #5a9aca;
   }
 
@@ -2326,7 +2395,8 @@
   }
 
   .tl-block.secondary.sel {
-    background: rgba(61, 220, 151, 0.13);
+    /* opaque equivalent of rgba(61,220,151,0.13) over the #1b1f26 base */
+    background: #1f3835;
     border-color: #3ddc97;
   }
 
@@ -2344,6 +2414,15 @@
     z-index: 5;
     background: #20262f;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  }
+
+  /* Hovering a calendar-column block expands it to the full lane width and to the front, so a
+     narrow overlap column is comfortably readable. Higher specificity than .tl-block.cal. */
+  .tl-block.cal:hover {
+    left: 8px;
+    right: 8px;
+    width: auto;
+    z-index: 6;
   }
 
   .tl-text {
