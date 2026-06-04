@@ -29,7 +29,11 @@
       maxCardAgeMinutes: 5,
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
-    display: { subtitleFontSize: 110 },
+    display: {
+      subtitleFontSize: 110,
+      sentenceCleanRegex: '\\(.*?\\)',
+      sentenceCleanRegexEnabled: false,
+    },
     media: {
       audioOffsetStart: 0.25,
       audioOffsetEnd: 0.25,
@@ -238,6 +242,16 @@
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+  }
+
+  function cleanSentence(text: string): string {
+    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
+    if (!sentenceCleanRegexEnabled || !sentenceCleanRegex) return text
+    try {
+      return text.replace(new RegExp(sentenceCleanRegex, 'gm'), '').trim()
+    } catch {
+      return text
+    }
   }
   const currentAudio = ref<HTMLAudioElement | null>(null)
   const pendingAudioRange = ref<{
@@ -684,7 +698,7 @@
       const fieldUpdates: Record<string, string> = {}
 
       if (sentenceField) {
-        const text = selectedMsgs.map((m) => m.subtitle).join(' ')
+        const text = selectedMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
         const existingSentence = targetNote.fields[sentenceField]?.value ?? ''
         fieldUpdates[sentenceField] = preserveHtmlTags(existingSentence, text)
       }
@@ -929,7 +943,7 @@
           <span
             class="subtitle-text"
             :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
-            >{{ message.subtitle }}</span
+            >{{ cleanSentence(message.subtitle) }}</span
           >
           <div class="actions">
             <div class="thumb-action">
@@ -1254,6 +1268,45 @@
                     <span>70%</span>
                     <span>200%</span>
                   </div>
+                </label>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Text processing</h3>
+              </div>
+              <div class="form-grid">
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.sentenceCleanRegexEnabled"
+                        @change="
+                          (e) =>
+                            (localDisplay.sentenceCleanRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
+                      />
+                    </label>
+                    Sentence clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.sentenceCleanRegex"
+                    :disabled="!localDisplay.sentenceCleanRegexEnabled"
+                    placeholder="e.g. ^\w[\w ]+:\s+ to strip speaker names"
+                    @input="
+                      (e) =>
+                        (localDisplay.sentenceCleanRegex = (e.target as HTMLInputElement).value)
+                    "
+                  />
+                  <small class="field-hint"
+                    >Applied to subtitle text. Matches are stripped. Affects display and Anki
+                    export.</small
+                  >
                 </label>
               </div>
             </section>
@@ -1867,9 +1920,31 @@
     border-radius: 6px;
   }
 
+  .form-group input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .field-hint {
     color: #7e8898;
     font-size: 0.85em;
+  }
+
+  .label-with-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.85em;
+    color: #7e8898;
+    font-weight: normal;
+    cursor: pointer;
+    user-select: none;
   }
 
   .muted-box {
