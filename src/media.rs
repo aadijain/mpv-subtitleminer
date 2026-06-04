@@ -105,11 +105,10 @@ impl ImageConfig {
             args.extend(["-vframes".into(), "1".into()]);
         }
 
-        if let Some(size) = &self.size {
-            if !size.trim().is_empty() {
+        if let Some(size) = &self.size
+            && !size.trim().is_empty() {
                 args.extend(["-vf".into(), format!("scale={}", size)]);
             }
-        }
 
         match self.format.as_str() {
             "jpeg" | "jpg" => {
@@ -206,11 +205,10 @@ impl AudioConfig {
         }
 
         let mut filters = vec!["afade=t=in:d=0.005".to_string()];
-        if let Some(f) = &self.filters {
-            if !f.trim().is_empty() {
+        if let Some(f) = &self.filters
+            && !f.trim().is_empty() {
                 filters.push(f.clone());
             }
-        }
         args.extend(["-af".into(), filters.join(",")]);
     }
 }

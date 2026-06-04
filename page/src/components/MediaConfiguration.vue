@@ -16,7 +16,7 @@
     set: (val) => emit('update:modelValue', val),
   })
 
-  const onMediaChange = (field: keyof MediaSettings, value: any) => {
+  const onMediaChange = <K extends keyof MediaSettings>(field: K, value: MediaSettings[K]) => {
     localMedia.value = { ...localMedia.value, [field]: value }
   }
 
@@ -41,7 +41,7 @@
         newMedia.imageAnimated = true
         newMedia.imageQuality = 75
       } else {
-        newMedia.imageFormat = val as any
+        newMedia.imageFormat = val as MediaSettings['imageFormat']
         newMedia.imageAnimated = false
         if (val === 'jpeg') newMedia.imageQuality = 5
         if (val === 'webp') newMedia.imageQuality = 80
@@ -158,7 +158,7 @@
       <div class="advanced-toggle">
         <span class="toggle-label">Advanced</span>
         <label class="switch">
-          <input type="checkbox" v-model="localMedia.imageAdvanced" />
+          <input v-model="localMedia.imageAdvanced" type="checkbox" />
           <span class="slider"></span>
         </label>
       </div>
@@ -201,7 +201,7 @@
       <label class="form-group">
         <span>Image resolution</span>
         <div class="input-group">
-          <input type="text" v-model="localMedia.imageSize" placeholder="e.g. 640:-2" />
+          <input v-model="localMedia.imageSize" type="text" placeholder="e.g. 640:-2" />
           <button
             class="btn-reset"
             :class="{ visible: localMedia.imageSize !== defaultSettings.media.imageSize }"
@@ -217,19 +217,19 @@
       <div class="advanced-row-header">
         <label class="form-group extension-box">
           <span>Extension</span>
-          <input type="text" v-model="localMedia.imageAdvancedExtension" placeholder="jpg" />
+          <input v-model="localMedia.imageAdvancedExtension" type="text" placeholder="jpg" />
         </label>
         <div class="advanced-toggle animated-switch-box">
           <span class="toggle-label">Animated</span>
           <label class="switch">
-            <input type="checkbox" v-model="localMedia.imageAnimated" />
+            <input v-model="localMedia.imageAnimated" type="checkbox" />
             <span class="slider"></span>
           </label>
         </div>
       </div>
       <label class="form-group full-width">
         <span>Raw FFmpeg Arguments</span>
-        <input type="text" v-model="localMedia.imageAdvancedArgs" placeholder="-c:v mjpeg -q:v 5" />
+        <input v-model="localMedia.imageAdvancedArgs" type="text" placeholder="-c:v mjpeg -q:v 5" />
       </label>
     </template>
 
@@ -240,7 +240,7 @@
       <div class="advanced-toggle">
         <span class="toggle-label">Advanced</span>
         <label class="switch">
-          <input type="checkbox" v-model="localMedia.audioAdvanced" />
+          <input v-model="localMedia.audioAdvanced" type="checkbox" />
           <span class="slider"></span>
         </label>
       </div>
@@ -277,8 +277,8 @@
       <label class="form-group full-width">
         <span>Custom audio filters</span>
         <input
-          type="text"
           v-model="localMedia.audioFilters"
+          type="text"
           placeholder="e.g. dynaudnorm, volume=2.0"
         />
       </label>
@@ -286,13 +286,13 @@
     <template v-else>
       <label class="form-group">
         <span>Extension</span>
-        <input type="text" v-model="localMedia.audioAdvancedExtension" placeholder="mp3" />
+        <input v-model="localMedia.audioAdvancedExtension" type="text" placeholder="mp3" />
       </label>
       <label class="form-group full-width">
         <span>Raw FFmpeg Arguments</span>
         <input
-          type="text"
           v-model="localMedia.audioAdvancedArgs"
+          type="text"
           placeholder="-c:a libmp3lame -b:a 128k (MP3 example)"
         />
       </label>

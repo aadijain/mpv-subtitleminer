@@ -128,8 +128,7 @@ async fn get_mpv_pid(mpv: &mut MpvStream) -> std::io::Result<u32> {
     };
     let status = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
     if status != "success" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("mpv returned error querying PID: {}", status),
         ));
     }
@@ -160,8 +159,7 @@ pub async fn run_server(
     if let Some(expected) = expected_mpv_pid {
         let actual = get_mpv_pid(&mut mpv).await?;
         if actual != expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "MPV_IPC_PID_MISMATCH expected={} actual={} socket={}",
                     expected, actual, socket_path
@@ -406,11 +404,10 @@ async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) ->
                 ProtocolRequest::Thumbnail { id, end_id, image_config } => {
                     let store = state.subtitles.read().await;
                     let mut sub = store.get(&id)?.clone();
-                    if let Some(eid) = end_id {
-                        if let Some(end_sub) = store.get(&eid) {
+                    if let Some(eid) = end_id
+                        && let Some(end_sub) = store.get(&eid) {
                             sub.sub_end = end_sub.sub_end;
                         }
-                    }
                     drop(store);
                     (
                         id,
