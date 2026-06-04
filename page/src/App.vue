@@ -246,7 +246,7 @@
   }
 
   const messages = ref<SubtitleMessage[]>([])
-  const bottomRef = ref<HTMLElement | null>(null)
+  const mainRef = ref<HTMLElement | null>(null)
   const loadingMedia = ref<Record<string, boolean>>({})
   // Floating screenshot preview: anchored to the hovered block's screenshot button. Rendered
   // via Teleport so it isn't clipped by the block's overflow. Shows once the thumbnail loads.
@@ -302,6 +302,15 @@
     height: `${Math.max(40, (m.sub_end - m.sub_start) * pixelsPerSecond.value)}px`,
   })
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
+
+  // Scroll so the given subtitle sits just below the sticky header. The header's own height
+  // cancels out (it occupies the top of the scroll content), so the target is simply its
+  // y-offset on the time axis minus a small margin.
+  const scrollToSubtitle = (msg: SubtitleMessage) => {
+    const el = mainRef.value
+    if (!el) return
+    el.scrollTop = Math.max(0, yFor(msg.sub_start) - 16)
+  }
 
   // Wipes the displayed subtitles and the current selection. Does NOT touch the page title -
   // callers that need to retitle (e.g. a media change) do so themselves.
@@ -412,7 +421,9 @@
         if (!msg) return
         messages.value.push(msg)
         if (messages.value.length > 200) messages.value.shift()
-        void nextTick(() => bottomRef.value?.scrollIntoView({ block: 'end' }))
+        // Follow the newest subtitle (works whether playback advanced or seeked), rather than
+        // always jumping to the bottom of the time axis.
+        void nextTick(() => scrollToSubtitle(msg))
         return
       }
 
@@ -1098,7 +1109,7 @@
       </div>
     </header>
 
-    <main class="main">
+    <main ref="mainRef" class="main">
       <div v-if="messages.length === 0" class="empty">Waiting for subtitles...</div>
       <div
         v-else
@@ -1242,8 +1253,6 @@
             </div>
           </div>
         </div>
-
-        <div ref="bottomRef" class="bottom-anchor" aria-hidden="true"></div>
       </div>
     </main>
 
@@ -2153,10 +2162,6 @@
     max-width: 420px;
     max-height: 240px;
     border-radius: 4px;
-  }
-
-  .bottom-anchor {
-    scroll-margin-bottom: calc(var(--selection-bar-height, 72px) + 16px);
   }
 
   .icon-btn:disabled {
