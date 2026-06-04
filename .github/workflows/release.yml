@@ -85,22 +85,24 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
-          mkdir -p dist/mpv/scripts
+          mkdir -p dist/mpv/scripts dist/mpv/script-opts
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/mpv/
           cp page/dist/index.html dist/mpv/
           cp mpv/mpv.conf dist/mpv/
           cp mpv/mpv-subtitleminer.lua dist/mpv/scripts/
+          cp mpv/script-opts/mpv-subtitleminer.conf dist/mpv/script-opts/
           cd dist && zip -r "../${{ matrix.artifact }}.zip" mpv
 
       - name: Package (macOS)
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
-          mkdir -p dist/mpv/scripts
+          mkdir -p dist/mpv/scripts dist/mpv/script-opts
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/mpv/
           cp page/dist/index.html dist/mpv/
           cp mpv/mpv.conf dist/mpv/
           cp mpv/mpv-subtitleminer.lua dist/mpv/scripts/
+          cp mpv/script-opts/mpv-subtitleminer.conf dist/mpv/script-opts/
           cd dist && zip -r "../${{ matrix.artifact }}.zip" mpv
 
       - name: Download ffmpeg.exe (Windows)
@@ -138,10 +140,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/mpv/scripts
+          New-Item -ItemType Directory -Force -Path dist/mpv/script-opts
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/mpv/
           Copy-Item page/dist/index.html dist/mpv/
           Copy-Item mpv/mpv.conf dist/mpv/
           Copy-Item mpv/mpv-subtitleminer.lua dist/mpv/scripts/
+          Copy-Item mpv/script-opts/mpv-subtitleminer.conf dist/mpv/script-opts/
           Compress-Archive -Path dist/mpv -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact
