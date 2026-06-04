@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Secondary subtitle support: stream mpv secondary subtitles and export them to Anki.
 - Timeline view: primary and secondary subs are displayed as parallel columns in a vertical timeline, each independently selectable.
 - Overlapping / Simultaneous subtitle handling (Ex: signs, SFX, TL notes) displayed side-by-side in the timeline
+- Style/Name filter: hide or show subtitle lines by their ASS Style or Name, per track, as a live display filter.
 
 ## Downloads
 
