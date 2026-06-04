@@ -66,12 +66,12 @@ impl PendingSubtitle {
         self.responses.iter().all(|r| r.is_some())
     }
 
-    fn into_subtitle(self, media_path: String, aid: i64) -> Subtitle {
+    fn into_subtitle(self, media_path: String, aid: i64, delay: f64) -> Subtitle {
         Subtitle {
             id: self.id,
             text: self.text,
-            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap(),
-            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap(),
+            sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap() + delay,
+            sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap() + delay,
             media_path,
             aid,
         }
@@ -220,7 +220,8 @@ async fn handle_mpv(
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
           {\"command\":[\"observe_property\",3,\"path\"]}\n\
-          {\"command\":[\"observe_property\",4,\"aid\"]}\n",
+          {\"command\":[\"observe_property\",4,\"aid\"]}\n\
+          {\"command\":[\"observe_property\",5,\"sub-delay\"]}\n",
     )
     .await?;
     info!("Connected to mpv, observing subtitle changes");
@@ -230,6 +231,9 @@ async fn handle_mpv(
     // instead of being queried per subtitle. Defaults to track 1 until mpv sends
     // the initial property-change for the observe.
     let mut current_aid: i64 = 1;
+    // Latest subtitle delay, kept current via the sub-delay observe (id 5) and
+    // applied to subtitle timing at emit time.
+    let mut current_sub_delay: f64 = 0.0;
     let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -268,7 +272,7 @@ async fn handle_mpv(
                 let sub = pending
                     .remove(&base_id)
                     .unwrap()
-                    .into_subtitle(media_path, current_aid);
+                    .into_subtitle(media_path, current_aid, current_sub_delay);
                 debug!("[sub:{}] Broadcasting", sub.id);
                 state.subtitles.write().await.insert(sub.id, sub.clone());
                 let _ = tx.send(SubtitleEvent::New(sub));
@@ -297,6 +301,14 @@ async fn handle_mpv(
         if json.get("id").and_then(|v| v.as_u64()) == Some(4) {
             if let Some(aid) = json.get("data").and_then(|d| d.as_i64()) {
                 current_aid = aid;
+            }
+            continue;
+        }
+
+        // Subtitle delay changed (observer id 5)
+        if json.get("id").and_then(|v| v.as_u64()) == Some(5) {
+            if let Some(delay) = json.get("data").and_then(|d| d.as_f64()) {
+                current_sub_delay = delay;
             }
             continue;
         }
