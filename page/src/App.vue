@@ -274,13 +274,52 @@
   // Purely a UI display filter: hide subtitle lines by their ASS Style or Name, per track,
   // without ever touching mpv. A line is shown only if BOTH its style and its name are
   // enabled (AND semantics). Hidden lines drop out of `visibleMessages`, so the timeline
-  // axis, gap markers and overlap columns all recompute around what's left. State lives for
-  // the session and is reset only by the Clear button (not on media change).
+  // axis, gap markers and overlap columns all recompute around what's left.
+  //  State persists across refreshes (localStorage).
   type FilterAxis = 'style' | 'name'
-  const hiddenFilters = reactive<Record<SubtitleTrack, Record<FilterAxis, Set<string>>>>({
-    primary: { style: new Set(), name: new Set() },
-    secondary: { style: new Set(), name: new Set() },
-  })
+  // Persisted across refreshes (separate from the Anki/display settings blob so it can be
+  // cleared independently). Sets aren't JSON-serializable, so we store/restore them as arrays.
+  const FILTERS_STORAGE_KEY = 'mpv_subtitle_tool_hidden_filters'
+  type HiddenFiltersSnapshot = Record<SubtitleTrack, Record<FilterAxis, string[]>>
+  function loadHiddenFilters(): Record<SubtitleTrack, Record<FilterAxis, Set<string>>> {
+    const empty = () => ({
+      primary: { style: new Set<string>(), name: new Set<string>() },
+      secondary: { style: new Set<string>(), name: new Set<string>() },
+    })
+    try {
+      const stored = localStorage.getItem(FILTERS_STORAGE_KEY)
+      if (!stored) return empty()
+      const parsed = JSON.parse(stored) as Partial<HiddenFiltersSnapshot>
+      const result = empty()
+      for (const track of ['primary', 'secondary'] as SubtitleTrack[]) {
+        for (const axis of ['style', 'name'] as FilterAxis[]) {
+          for (const value of parsed[track]?.[axis] ?? []) result[track][axis].add(value)
+        }
+      }
+      return result
+    } catch (err) {
+      console.warn('Failed to load filters', err)
+      return empty()
+    }
+  }
+  const hiddenFilters =
+    reactive<Record<SubtitleTrack, Record<FilterAxis, Set<string>>>>(loadHiddenFilters())
+
+  watch(
+    hiddenFilters,
+    (value) => {
+      try {
+        const snapshot: HiddenFiltersSnapshot = {
+          primary: { style: [...value.primary.style], name: [...value.primary.name] },
+          secondary: { style: [...value.secondary.style], name: [...value.secondary.name] },
+        }
+        localStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(snapshot))
+      } catch (err) {
+        console.warn('Failed to save filters', err)
+      }
+    },
+    { deep: true },
+  )
 
   const isMessageVisible = (m: SubtitleMessage) =>
     !hiddenFilters[m.track].style.has(m.style) && !hiddenFilters[m.track].name.has(m.name)
@@ -289,13 +328,6 @@
     const set = hiddenFilters[track][axis]
     if (set.has(value)) set.delete(value)
     else set.add(value)
-  }
-
-  const resetFilters = () => {
-    for (const track of ['primary', 'secondary'] as SubtitleTrack[]) {
-      hiddenFilters[track].style.clear()
-      hiddenFilters[track].name.clear()
-    }
   }
 
   // Distinct Style/Name values present per track, in first-seen order, each with a line
@@ -626,7 +658,9 @@
     messages.value = []
     selectedMessages.value = new Set()
     selectedSecondary.value = new Set()
-    resetFilters()
+    // Note: hiddenFilters is intentionally kept - clearing only wipes the displayed
+    // subtitles (and thus the chip list), not the user's style/name selections, which
+    // persist so the same styles/names stay hidden when lines stream back in.
     // Reset each connected server's dedup set so already-seen lines can stream in
     // again (otherwise they'd be suppressed and never reappear on the cleared screen).
     for (const port of ws.connectedPorts.value) ws.send({ request: 'clear' }, port)
