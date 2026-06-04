@@ -340,6 +340,11 @@
   }
   const tagLabel = (value: string) => value || '(none)'
 
+  // The whole chip row collapses to a slim bar (session-only UI pref). When collapsed and a
+  // filter is active, the bar flags it so hidden lines aren't a silent surprise.
+  const filterCollapsed = ref(false)
+  const anyFilterHidden = computed(() => filterColumns.value.some((c) => c.hasHidden))
+
   // Split the single message stream into two time-ordered columns by track, dropping any
   // line hidden by the style/name filter so everything downstream readjusts.
   const sortByTime = (a: SubtitleMessage, b: SubtitleMessage) =>
@@ -1421,10 +1426,40 @@
 
           <!-- Style/Name filter chips: a UI-only display filter. Each chip toggles whether
                lines with that ASS Style or Name show in its column; nothing is sent to mpv. -->
-          <div class="tl-filter">
-            <div class="tl-filter-gutter" aria-hidden="true"></div>
+          <div class="tl-filter" :class="{ collapsed: filterCollapsed }">
+            <button
+              class="tl-filter-toggle"
+              type="button"
+              :title="filterCollapsed ? 'Show style/name filters' : 'Hide style/name filters'"
+              :aria-expanded="!filterCollapsed"
+              @click="filterCollapsed = !filterCollapsed"
+            >
+              <svg
+                class="chev"
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            <button
+              v-if="filterCollapsed"
+              class="tl-filter-summary"
+              type="button"
+              @click="filterCollapsed = false"
+            >
+              Style / Name filter
+              <span v-if="anyFilterHidden" class="tl-filter-active">· active</span>
+            </button>
             <div
               v-for="col in filterColumns"
+              v-show="!filterCollapsed"
               :key="col.track"
               class="tl-filter-col"
               :class="col.track"
@@ -2319,9 +2354,50 @@
     border-bottom: 1px solid #252b34;
   }
 
-  .tl-filter-gutter {
+  /* Collapse toggle occupies the 56px gutter slot so the columns still line up with the lanes. */
+  .tl-filter-toggle {
     flex: none;
     width: 56px;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #7c8aa1;
+    cursor: pointer;
+  }
+  .tl-filter-toggle:hover {
+    color: #e9edf2;
+  }
+  .tl-filter-toggle .chev {
+    transition: transform 0.15s ease;
+  }
+  .tl-filter.collapsed .tl-filter-toggle .chev {
+    transform: rotate(-90deg);
+  }
+
+  .tl-filter-summary {
+    flex: 1;
+    align-self: stretch;
+    text-align: left;
+    padding: 7px 0;
+    background: transparent;
+    border: none;
+    color: #5f6b7d;
+    font: inherit;
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  .tl-filter-summary:hover {
+    color: #a7b4c7;
+  }
+  .tl-filter-active {
+    color: #5a9aca;
+    letter-spacing: 0;
   }
 
   .tl-filter-col {
