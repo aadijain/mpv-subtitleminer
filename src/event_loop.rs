@@ -44,7 +44,7 @@ impl SharedState {
 struct PendingSubtitle {
     id: u64,
     text: String,
-    responses: [Option<serde_json::Value>; 3], // sub_start, sub_end, aid
+    responses: [Option<serde_json::Value>; 2], // sub_start, sub_end
 }
 
 impl PendingSubtitle {
@@ -57,7 +57,7 @@ impl PendingSubtitle {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 3 {
+        if index < 2 {
             self.responses[index] = Some(value);
         }
     }
@@ -66,14 +66,14 @@ impl PendingSubtitle {
         self.responses.iter().all(|r| r.is_some())
     }
 
-    fn into_subtitle(self, media_path: String) -> Subtitle {
+    fn into_subtitle(self, media_path: String, aid: i64) -> Subtitle {
         Subtitle {
             id: self.id,
             text: self.text,
             sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap(),
             sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap(),
             media_path,
-            aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
+            aid,
         }
     }
 }
@@ -219,12 +219,17 @@ async fn handle_mpv(
 ) -> std::io::Result<()> {
     mpv.write_all(
         b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
-          {\"command\":[\"observe_property\",3,\"path\"]}\n",
+          {\"command\":[\"observe_property\",3,\"path\"]}\n\
+          {\"command\":[\"observe_property\",4,\"aid\"]}\n",
     )
     .await?;
     info!("Connected to mpv, observing subtitle changes");
 
     let mut current_path: Option<String> = None;
+    // Latest selected audio track id, kept current via the `aid` observe (id 4)
+    // instead of being queried per subtitle. Defaults to track 1 until mpv sends
+    // the initial property-change for the observe.
+    let mut current_aid: i64 = 1;
     let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -260,7 +265,10 @@ async fn handle_mpv(
 
             for base_id in completed {
                 let media_path = current_path.clone().unwrap_or_default();
-                let sub = pending.remove(&base_id).unwrap().into_subtitle(media_path);
+                let sub = pending
+                    .remove(&base_id)
+                    .unwrap()
+                    .into_subtitle(media_path, current_aid);
                 debug!("[sub:{}] Broadcasting", sub.id);
                 state.subtitles.write().await.insert(sub.id, sub.clone());
                 let _ = tx.send(SubtitleEvent::New(sub));
@@ -285,6 +293,14 @@ async fn handle_mpv(
             continue;
         }
 
+        // Audio track changed (observer id 4)
+        if json.get("id").and_then(|v| v.as_u64()) == Some(4) {
+            if let Some(aid) = json.get("data").and_then(|d| d.as_i64()) {
+                current_aid = aid;
+            }
+            continue;
+        }
+
         // Handle subtitle property changes (observer id 1)
         if let Some(text) = json
             .get("data")
@@ -297,16 +313,15 @@ async fn handle_mpv(
             let base_id = next_request_id;
             next_request_id += 10;
 
-            // Query all properties we need
+            // Query the per-subtitle timing properties; aid is observed
+            // separately (id 4) and read from `current_aid`.
             let cmd = format!(
                 concat!(
                     "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
-                    "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n"
+                    "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n"
                 ),
                 base_id,
-                base_id + 1,
-                base_id + 2
+                base_id + 1
             );
 
             mpv.write_all(cmd.as_bytes()).await?;
