@@ -24,6 +24,7 @@
       noteType: '',
       frontField: '',
       sentenceField: '',
+      secondaryField: '',
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
@@ -35,6 +36,8 @@
       mediaFilenameRegexEnabled: true,
       sentenceCleanRegex: '\\(.*?\\)',
       sentenceCleanRegexEnabled: false,
+      secondaryCleanRegex: '\\(.*?\\)',
+      secondaryCleanRegexEnabled: false,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -90,8 +93,8 @@
   )
 
   const ankiConfigured = computed(() => {
-    const { noteType, sentenceField, audioField, imageField } = settings.value.anki
-    return !!noteType && (!!sentenceField || !!audioField || !!imageField)
+    const { noteType, sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
   })
 
   const showSettings = ref(false)
@@ -114,10 +117,10 @@
     return model ? (modelsWithFields.value[model] ?? []) : []
   })
   const settingsValid = computed(() => {
-    const { noteType, sentenceField, audioField, imageField } = localSettings.value
+    const { noteType, sentenceField, secondaryField, audioField, imageField } = localSettings.value
     // Allow saving if Anki is not configured
     if (!noteType) return true
-    return !!sentenceField || !!audioField || !!imageField
+    return !!sentenceField || !!secondaryField || !!audioField || !!imageField
   })
 
   watch(showSettings, (isOpen) => {
@@ -168,6 +171,7 @@
       noteType: value,
       frontField: '',
       sentenceField: '',
+      secondaryField: '',
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
@@ -319,14 +323,23 @@
     return title.trim()
   }
 
-  function cleanSentence(text: string): string {
-    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
-    if (!sentenceCleanRegexEnabled || !sentenceCleanRegex) return text
+  function applyCleanRegex(text: string, pattern: string, enabled: boolean): string {
+    if (!enabled || !pattern) return text
     try {
-      return text.replace(new RegExp(sentenceCleanRegex, 'gm'), '').trim()
+      return text.replace(new RegExp(pattern, 'gm'), '').trim()
     } catch {
       return text
     }
+  }
+
+  function cleanSentence(text: string): string {
+    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
+    return applyCleanRegex(text, sentenceCleanRegex, sentenceCleanRegexEnabled)
+  }
+
+  function cleanSecondary(text: string): string {
+    const { secondaryCleanRegex, secondaryCleanRegexEnabled } = settings.value.display
+    return applyCleanRegex(text, secondaryCleanRegex, secondaryCleanRegexEnabled)
   }
   const currentAudio = ref<HTMLAudioElement | null>(null)
   const pendingAudioRange = ref<{
@@ -561,6 +574,10 @@
     return primaryMessages.value.filter((m) => selectedMessages.value.has(m.uid))
   }
 
+  const getSelectedSecondaryMessages = (): SubtitleMessage[] => {
+    return secondaryMessages.value.filter((m) => selectedSecondary.value.has(m.uid))
+  }
+
   const getSelectionRange = (): { first: SubtitleMessage; last: SubtitleMessage } | null => {
     const selected = getSelectedMessages()
     if (selected.length === 0) return null
@@ -597,7 +614,10 @@
   })
 
   const updateTargetCardPreview = async () => {
-    if (selectedMessages.value.size === 0 || !ankiConfigured.value) {
+    if (
+      (selectedMessages.value.size === 0 && selectedSecondary.value.size === 0) ||
+      !ankiConfigured.value
+    ) {
       targetCardPreview.value = null
       return
     }
@@ -635,7 +655,7 @@
   }
 
   watch(
-    () => selectedMessages.value.size,
+    () => selectedMessages.value.size + selectedSecondary.value.size,
     () => updateTargetCardPreview(),
     { immediate: true },
   )
@@ -800,23 +820,24 @@
   }
 
   const sendSelectionToAnki = async () => {
-    const selectedMsgs = getSelectedMessages()
-    if (!ankiConfigured.value || selectedMsgs.length === 0) return
+    const primaryMsgs = getSelectedMessages()
+    const secondaryMsgs = getSelectedSecondaryMessages()
+    if (!ankiConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0)) return
 
-    const { sentenceField, audioField, imageField } = settings.value.anki
-    const { first, last } = getSelectionRange() ?? {}
-    if (!first || !last) return
+    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    const range = getSelectionRange() // primary first/last (audio/image come from primary)
+    const first = range?.first
+    const last = range?.last
 
-    const primaryKey = first.uid
-    const primaryId = first.id
-    sendingToAnki.value[primaryKey] = true
-    ankiError.value[primaryKey] = ''
+    // State is tracked against an anchor: the primary selection if any, else the secondary.
+    const anchor = primaryMsgs[0] ?? secondaryMsgs[0]
+    if (!anchor) return
+    const anchorKey = anchor.uid
+    const mediaId = first?.id ?? anchor.id
+    sendingToAnki.value[anchorKey] = true
+    ankiError.value[anchorKey] = ''
 
     try {
-      if (!ankiConfigured.value) {
-        throw new Error('Anki settings are incomplete')
-      }
-
       const targetNote = await anki.getLastNote(settings.value.anki.noteType)
       if (!targetNote) {
         throw new Error('No target card found in Anki')
@@ -835,44 +856,50 @@
 
       const fieldUpdates: Record<string, string> = {}
 
-      if (sentenceField) {
-        const text = selectedMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
-        const existingSentence = targetNote.fields[sentenceField]?.value ?? ''
-        fieldUpdates[sentenceField] = preserveHtmlTags(existingSentence, text)
+      if (sentenceField && primaryMsgs.length > 0) {
+        const text = primaryMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
+        const existing = targetNote.fields[sentenceField]?.value ?? ''
+        fieldUpdates[sentenceField] = preserveHtmlTags(existing, text)
       }
 
-      if (audioField) {
-        if (selectedMsgs.length > 1) {
+      if (secondaryField && secondaryMsgs.length > 0) {
+        const text = secondaryMsgs.map((m) => cleanSecondary(m.subtitle)).join(' ')
+        const existing = targetNote.fields[secondaryField]?.value ?? ''
+        fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
+      }
+
+      if (audioField && first && last) {
+        if (primaryMsgs.length > 1) {
           const selectionPort = first.sourcePort
-          const allSamePort = selectedMsgs.every((msg) => msg.sourcePort === selectionPort)
+          const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
           if (!allSamePort) {
             throw new Error('Selected subtitles must come from the same connection for audio.')
           }
         }
-        let audioData =
-          selectedMsgs.length > 1
+        const audioData =
+          primaryMsgs.length > 1
             ? await requestAudioRange(first.id, last.id, first.sourcePort)
             : first.audio || (await requestMediaFromServer(first, 'audio'))
 
         if (audioData) {
-          const filename = generateMediaFilename(primaryId, 'audio')
+          const filename = generateMediaFilename(mediaId, 'audio')
           await anki.storeMediaFile(filename, audioData)
           fieldUpdates[audioField] = `[sound:${filename}]`
         }
       }
 
-      if (imageField) {
-        let imageData = selectedMsgs.length === 1 ? first.thumbnail : undefined
+      if (imageField && first && last) {
+        let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
 
         if (!imageData) {
           imageData = await requestMediaFromServer(
             first,
             'thumbnail',
-            selectedMsgs.length > 1 ? last.id : undefined,
+            primaryMsgs.length > 1 ? last.id : undefined,
           )
         }
         if (imageData) {
-          const filename = generateMediaFilename(primaryId, 'image')
+          const filename = generateMediaFilename(mediaId, 'image')
           await anki.storeMediaFile(filename, imageData)
           fieldUpdates[imageField] = `<img src="${filename}">`
         }
@@ -880,9 +907,10 @@
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
-        ankiSuccess.value[primaryKey] = true
+        ankiSuccess.value[anchorKey] = true
         const noteId = targetNote.noteId
-        toast.success(`Added ${selectedMsgs.length} subtitle(s) to Anki`, {
+        const count = primaryMsgs.length + secondaryMsgs.length
+        toast.success(`Added ${count} subtitle(s) to Anki`, {
           duration: 5000,
           action: {
             label: 'Browse',
@@ -893,15 +921,15 @@
         })
 
         setTimeout(() => {
-          delete ankiSuccess.value[primaryKey]
+          delete ankiSuccess.value[anchorKey]
           clearSelection()
         }, 2000)
       }
     } catch (err) {
-      ankiError.value[primaryKey] = err instanceof Error ? err.message : 'Unknown error'
+      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
       toast.error(err instanceof Error ? err.message : 'Failed to add to Anki')
     } finally {
-      delete sendingToAnki.value[primaryKey]
+      delete sendingToAnki.value[anchorKey]
     }
   }
 
@@ -1198,7 +1226,7 @@
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
-              <span class="tl-text">{{ cleanSentence(message.subtitle) }}</span>
+              <span class="tl-text">{{ cleanSecondary(message.subtitle) }}</span>
             </div>
           </div>
         </div>
@@ -1229,7 +1257,9 @@
       <div class="selection-right">
         <button
           class="selection-btn send-btn"
-          :disabled="!targetCardPreview || selectedMessages.size === 0"
+          :disabled="
+            !targetCardPreview || (selectedMessages.size === 0 && selectedSecondary.size === 0)
+          "
           @click="sendSelectionToAnki"
         >
           📝 Add to Anki
@@ -1370,6 +1400,24 @@
                         {{ field }}
                       </option>
                     </select>
+                    <small class="field-hint">Filled from the primary column selection</small>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Secondary sentence field</span>
+                    <select
+                      :value="localSettings.secondaryField"
+                      @change="
+                        (e) =>
+                          onFieldChange('secondaryField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't update</option>
+                      <option v-for="field in availableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                    <small class="field-hint">Filled from the secondary column selection</small>
                   </label>
 
                   <label class="form-group">
@@ -1475,7 +1523,7 @@
                         "
                       />
                     </label>
-                    Sentence clean regex
+                    Primary clean regex
                   </span>
                   <input
                     type="text"
@@ -1488,8 +1536,39 @@
                     "
                   />
                   <small class="field-hint"
-                    >Applied to subtitle text. Matches are stripped. Affects display and Anki
-                    export.</small
+                    >Applied to primary subtitle text. Matches are stripped. Affects display and
+                    Anki export.</small
+                  >
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.secondaryCleanRegexEnabled"
+                        @change="
+                          (e) =>
+                            (localDisplay.secondaryCleanRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
+                      />
+                    </label>
+                    Secondary clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.secondaryCleanRegex"
+                    :disabled="!localDisplay.secondaryCleanRegexEnabled"
+                    placeholder="e.g. \(.*?\) to strip bracketed notes"
+                    @input="
+                      (e) =>
+                        (localDisplay.secondaryCleanRegex = (e.target as HTMLInputElement).value)
+                    "
+                  />
+                  <small class="field-hint"
+                    >Applied to secondary subtitle text. Matches are stripped. Affects display and
+                    Anki export.</small
                   >
                 </label>
                 <label class="form-group" style="grid-column: 1 / -1">
@@ -1792,13 +1871,13 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0 16px;
+    padding: 0;
     padding-bottom: calc(var(--selection-bar-height, 72px) + 16px);
   }
 
   .empty {
     color: #6c7687;
-    padding: 16px 8px;
+    padding: 16px;
     font-size: 1.05em;
   }
 
