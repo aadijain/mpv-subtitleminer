@@ -266,10 +266,13 @@
     messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
   )
 
-  // Proportional vertical timeline: a shared time axis both columns are positioned against.
-  // Zoom (px per second) is configured in Settings → Display.
+  // Vertical timeline: a shared time axis both columns are positioned against. Time runs at
+  // `pixelsPerSecond` (configured in Settings → Display) EXCEPT inside long gaps with no subs
+  // in either column, which are capped at MAX_GAP_PX so silence / seek dead-zones don't waste
+  // space. The axis is therefore piecewise-linear (intentionally non-uniform).
   const PPS_MIN = 30
   const PPS_MAX = 240
+  const MAX_GAP_PX = 48
   const pixelsPerSecond = computed(() => settings.value.display.timelineZoom)
 
   const timelineBounds = computed(() => {
@@ -282,25 +285,103 @@
     }
     return { start: Math.max(0, Math.floor(start)), end: Math.ceil(end) }
   })
-  const timelineHeight = computed(
-    () => (timelineBounds.value.end - timelineBounds.value.start) * pixelsPerSecond.value,
-  )
+
+  interface TimelineSegment {
+    t0: number
+    t1: number
+    y0: number
+    y1: number
+    capped: boolean // a gap whose height was clamped below true scale
+  }
+
+  // Build the piecewise time→pixel mapping: covered spans (any sub present) render at full
+  // scale; gaps render at min(trueHeight, MAX_GAP_PX).
+  const timeline = computed(() => {
+    const segs: TimelineSegment[] = []
+    if (messages.value.length === 0) return { segs, total: 0 }
+    const { start, end } = timelineBounds.value
+    const pps = pixelsPerSecond.value
+
+    const intervals = messages.value
+      .map((m) => ({ a: m.sub_start, b: m.sub_end }))
+      .sort((x, y) => x.a - y.a)
+    const covered: { a: number; b: number }[] = []
+    for (const iv of intervals) {
+      const last = covered[covered.length - 1]
+      if (!last || iv.a > last.b) covered.push({ a: iv.a, b: Math.max(iv.b, iv.a) })
+      else last.b = Math.max(last.b, iv.b)
+    }
+
+    let y = 0
+    let cursor = start
+    const push = (t0: number, t1: number, isGap: boolean) => {
+      if (t1 <= t0) return
+      const trueHeight = (t1 - t0) * pps
+      const capped = isGap && trueHeight > MAX_GAP_PX
+      const h = capped ? MAX_GAP_PX : trueHeight
+      segs.push({ t0, t1, y0: y, y1: y + h, capped })
+      y += h
+    }
+    for (const span of covered) {
+      if (span.a > cursor) push(cursor, span.a, true)
+      push(Math.max(span.a, cursor), span.b, false)
+      cursor = Math.max(cursor, span.b)
+    }
+    if (end > cursor) push(cursor, end, true)
+    return { segs, total: y }
+  })
+
+  const timelineHeight = computed(() => timeline.value.total)
+
+  const yFor = (t: number) => {
+    const { segs } = timeline.value
+    const first = segs[0]
+    const lastSeg = segs[segs.length - 1]
+    if (!first || !lastSeg) return 0
+    if (t <= first.t0) return first.y0
+    for (const s of segs) {
+      if (t <= s.t1) {
+        const f = s.t1 === s.t0 ? 0 : (t - s.t0) / (s.t1 - s.t0)
+        return s.y0 + f * (s.y1 - s.y0)
+      }
+    }
+    return lastSeg.y1
+  }
+
+  const segmentAt = (t: number) => timeline.value.segs.find((s) => t >= s.t0 && t <= s.t1)
+
   const tickStep = computed(() => {
     const target = 64 / pixelsPerSecond.value // aim for ~64px between gutter ticks
     return [1, 2, 5, 10, 15, 20, 30, 60, 120, 300].find((s) => s >= target) ?? 600
   })
+  // Ticks at nice intervals, positioned via the piecewise map. Skip any that land inside a
+  // capped gap (that range is collapsed and gets a "gap" marker instead).
   const ticks = computed(() => {
     const { start, end } = timelineBounds.value
     const step = tickStep.value
-    const out: number[] = []
-    for (let t = Math.ceil(start / step) * step; t <= end; t += step) out.push(t)
+    const out: { t: number; y: number }[] = []
+    for (let t = Math.ceil(start / step) * step; t <= end; t += step) {
+      if (segmentAt(t)?.capped) continue
+      out.push({ t, y: yFor(t) })
+    }
     return out
   })
-  const yFor = (t: number) => (t - timelineBounds.value.start) * pixelsPerSecond.value
-  const blockStyle = (m: SubtitleMessage) => ({
-    top: `${yFor(m.sub_start)}px`,
-    height: `${Math.max(40, (m.sub_end - m.sub_start) * pixelsPerSecond.value)}px`,
-  })
+
+  // Collapsed gaps get a labelled marker spanning their (clamped) height.
+  const gapMarkers = computed(() =>
+    timeline.value.segs
+      .filter((s) => s.capped)
+      .map((s) => {
+        const secs = Math.round(s.t1 - s.t0)
+        const label = secs >= 60 ? `⋯ ${Math.floor(secs / 60)}m ${secs % 60}s` : `⋯ ${secs}s`
+        return { top: s.y0, height: s.y1 - s.y0, label }
+      }),
+  )
+
+  const blockStyle = (m: SubtitleMessage) => {
+    const top = yFor(m.sub_start)
+    return { top: `${top}px`, height: `${Math.max(40, yFor(m.sub_end) - top)}px` }
+  }
   const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
 
   // Scroll so the given subtitle sits just below the sticky header. The header's own height
@@ -1145,9 +1226,23 @@
 
         <div class="tl-body" :style="{ height: `${timelineHeight}px` }">
           <div class="tl-gutter">
-            <div v-for="t in ticks" :key="t" class="tl-tick" :style="{ top: `${yFor(t)}px` }">
-              <span class="tl-tick-label">{{ fmtTime(t) }}</span>
+            <div
+              v-for="tick in ticks"
+              :key="tick.t"
+              class="tl-tick"
+              :style="{ top: `${tick.y}px` }"
+            >
+              <span class="tl-tick-label">{{ fmtTime(tick.t) }}</span>
             </div>
+          </div>
+
+          <div
+            v-for="(gap, i) in gapMarkers"
+            :key="`gap-${i}`"
+            class="tl-gap"
+            :style="{ top: `${gap.top}px`, height: `${gap.height}px` }"
+          >
+            <span class="tl-gap-label">{{ gap.label }}</span>
           </div>
 
           <div class="tl-lane primary">
@@ -1544,7 +1639,7 @@
                   </div>
                 </label>
                 <label class="form-group">
-                  <span>Timeline zoom ({{ localDisplay.timelineZoom }} px/s)</span>
+                  <span>Timeline zoom</span>
                   <input
                     type="range"
                     :min="PPS_MIN"
@@ -1558,8 +1653,8 @@
                     "
                   />
                   <div class="range-labels">
-                    <span>{{ PPS_MIN }} px/s</span>
-                    <span>{{ PPS_MAX }} px/s</span>
+                    <span>Out</span>
+                    <span>In</span>
                   </div>
                 </label>
               </div>
@@ -2030,6 +2125,35 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* collapsed-gap marker (a deliberate break in the time axis), centered within the
+     primary column to match .tl-lane.primary geometry */
+  .tl-gap {
+    position: absolute;
+    left: 56px;
+    width: calc((100% - 56px) / 2);
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #5b6472;
+    font-size: 0.72em;
+    letter-spacing: 0.05em;
+  }
+
+  .tl-gap::before,
+  .tl-gap::after {
+    content: '';
+    flex: 1;
+    border-top: 1px dashed #2a313c;
+    margin: 0 12px;
+  }
+
+  .tl-gap-label {
+    background: #14171c;
+    padding: 0 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
   .tl-lane {
     position: absolute;
     top: 0;
@@ -2053,7 +2177,8 @@
     display: none;
   }
 
-  .timeline.hide-secondary .tl-lane.primary {
+  .timeline.hide-secondary .tl-lane.primary,
+  .timeline.hide-secondary .tl-gap {
     width: auto;
     right: 0;
     border-right: none;
