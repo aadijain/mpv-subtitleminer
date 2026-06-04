@@ -31,6 +31,8 @@
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
       subtitleFontSize: 110,
+      mediaFilenameRegex: '^\\[.*?\\]\\s*|\\s*S\\d+E\\d+.*$',
+      mediaFilenameRegexEnabled: true,
       sentenceCleanRegex: '\\(.*?\\)',
       sentenceCleanRegexEnabled: false,
     },
@@ -239,9 +241,25 @@
   const loadingMedia = ref<Record<string, boolean>>({})
   const selectedMessages = ref<Set<string>>(new Set())
 
+  // Wipes the displayed subtitles and the current selection. Does NOT touch the page title -
+  // callers that need to retitle (e.g. a media change) do so themselves.
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+  }
+
+  function titleFromMediaPath(mediaPath: string): string {
+    const filename = mediaPath.replace(/\\/g, '/').split('/').pop() ?? mediaPath
+    let title = filename.replace(/\.[^.]+$/, '')
+    const { mediaFilenameRegex, mediaFilenameRegexEnabled } = settings.value.display
+    if (mediaFilenameRegexEnabled && mediaFilenameRegex) {
+      try {
+        title = title.replace(new RegExp(mediaFilenameRegex, 'g'), '').trim()
+      } catch {
+        // invalid regex - use raw title
+      }
+    }
+    return title.trim()
   }
 
   function cleanSentence(text: string): string {
@@ -289,6 +307,10 @@
     localPortInput.value = localConnection.value.ports.join(', ')
   }
 
+  // Tracks the media path the UI last reflected, so a media_changed re-sent on reconnect
+  // (same path) doesn't clear the list - only an actual file change does.
+  let lastMediaPath: string | null = null
+
   const ws = useWebSocket({
     host,
     ports,
@@ -298,6 +320,20 @@
       const type = data.type
       if (typeof type !== 'string') return
       const d = data
+
+      if (type === 'media_changed') {
+        const path = asString(d.path)
+        // The server re-sends media_changed on every (re)connect to seed the title, so only
+        // treat it as a real file change (and clear) when the path actually differs - otherwise
+        // a transient WebSocket reconnect would wipe the accumulated list. A new file's subs are
+        // stale, so clear them just like the Clear button does, then retitle for the new file.
+        if (path !== lastMediaPath) {
+          lastMediaPath = path
+          clearMessages()
+        }
+        document.title = path ? titleFromMediaPath(path) : 'Subtitle Tool Page'
+        return
+      }
 
       if (type === 'subtitle') {
         const msg = parseSubtitleMessage(d, port)
@@ -1306,6 +1342,37 @@
                   <small class="field-hint"
                     >Applied to subtitle text. Matches are stripped. Affects display and Anki
                     export.</small
+                  >
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.mediaFilenameRegexEnabled"
+                        @change="
+                          (e) =>
+                            (localDisplay.mediaFilenameRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
+                      />
+                    </label>
+                    Filename clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.mediaFilenameRegex"
+                    :disabled="!localDisplay.mediaFilenameRegexEnabled"
+                    placeholder="Leave empty to use the full filename"
+                    @input="
+                      (e) =>
+                        (localDisplay.mediaFilenameRegex = (e.target as HTMLInputElement).value)
+                    "
+                  />
+                  <small class="field-hint"
+                    >Applied globally to the filename (extension removed) to derive the page title.
+                    Matches are stripped.</small
                   >
                 </label>
               </div>

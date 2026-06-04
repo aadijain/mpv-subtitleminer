@@ -21,14 +21,22 @@ pub struct Subtitle {
     pub aid: i64,
 }
 
+#[derive(Clone)]
+pub enum SubtitleEvent {
+    New(Subtitle),
+    MediaChanged(String),
+}
+
 struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
+    current_media_path: RwLock<Option<String>>,
 }
 
 impl SharedState {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
+            current_media_path: RwLock::new(None),
         })
     }
 }
@@ -36,7 +44,7 @@ impl SharedState {
 struct PendingSubtitle {
     id: u64,
     text: String,
-    responses: [Option<serde_json::Value>; 4], // sub_start, sub_end, path, aid
+    responses: [Option<serde_json::Value>; 3], // sub_start, sub_end, aid
 }
 
 impl PendingSubtitle {
@@ -49,7 +57,7 @@ impl PendingSubtitle {
     }
 
     fn set_response(&mut self, index: usize, value: serde_json::Value) {
-        if index < 4 {
+        if index < 3 {
             self.responses[index] = Some(value);
         }
     }
@@ -58,19 +66,14 @@ impl PendingSubtitle {
         self.responses.iter().all(|r| r.is_some())
     }
 
-    fn into_subtitle(self) -> Subtitle {
+    fn into_subtitle(self, media_path: String) -> Subtitle {
         Subtitle {
             id: self.id,
             text: self.text,
             sub_start: self.responses[0].as_ref().unwrap().as_f64().unwrap(),
             sub_end: self.responses[1].as_ref().unwrap().as_f64().unwrap(),
-            media_path: self.responses[2]
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string(),
-            aid: self.responses[3].as_ref().unwrap().as_i64().unwrap(),
+            media_path,
+            aid: self.responses[2].as_ref().unwrap().as_i64().unwrap(),
         }
     }
 }
@@ -177,7 +180,7 @@ pub async fn run_server(
     );
 
     let state = SharedState::new();
-    let (subtitle_tx, _) = broadcast::channel::<Subtitle>(64);
+    let (subtitle_tx, _) = broadcast::channel::<SubtitleEvent>(64);
 
     let mpv_state = state.clone();
     let mpv_tx = subtitle_tx.clone();
@@ -212,12 +215,16 @@ pub async fn run_server(
 async fn handle_mpv(
     mut mpv: MpvStream,
     state: Arc<SharedState>,
-    tx: broadcast::Sender<Subtitle>,
+    tx: broadcast::Sender<SubtitleEvent>,
 ) -> std::io::Result<()> {
-    mpv.write_all(b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n")
-        .await?;
+    mpv.write_all(
+        b"{\"command\":[\"observe_property\",1,\"sub-text\"]}\n\
+          {\"command\":[\"observe_property\",3,\"path\"]}\n",
+    )
+    .await?;
     info!("Connected to mpv, observing subtitle changes");
 
+    let mut current_path: Option<String> = None;
     let mut pending: HashMap<u64, PendingSubtitle> = HashMap::new();
     let mut next_subtitle_id = 1u64;
     let mut next_request_id = 10u64;
@@ -252,20 +259,37 @@ async fn handle_mpv(
                 .collect();
 
             for base_id in completed {
-                let sub = pending.remove(&base_id).unwrap().into_subtitle();
+                let media_path = current_path.clone().unwrap_or_default();
+                let sub = pending.remove(&base_id).unwrap().into_subtitle(media_path);
                 debug!("[sub:{}] Broadcasting", sub.id);
                 state.subtitles.write().await.insert(sub.id, sub.clone());
-                let _ = tx.send(sub);
+                let _ = tx.send(SubtitleEvent::New(sub));
             }
             continue;
         }
 
-        // Handle subtitle property changes
-        if json.get("event") == Some(&serde_json::json!("property-change"))
-            && let Some(text) = json
-                .get("data")
-                .and_then(|d| d.as_str())
-                .filter(|s| !s.is_empty())
+        if json.get("event") != Some(&serde_json::json!("property-change")) {
+            continue;
+        }
+
+        // Media file path changed (observer id 3)
+        if json.get("id").and_then(|v| v.as_u64()) == Some(3) {
+            if let Some(path) = json.get("data").and_then(|d| d.as_str()) {
+                let path = path.to_string();
+                if current_path.as_deref() != Some(&path) {
+                    current_path = Some(path.clone());
+                    *state.current_media_path.write().await = Some(path.clone());
+                    let _ = tx.send(SubtitleEvent::MediaChanged(path));
+                }
+            }
+            continue;
+        }
+
+        // Handle subtitle property changes (observer id 1)
+        if let Some(text) = json
+            .get("data")
+            .and_then(|d| d.as_str())
+            .filter(|s| !s.is_empty())
         {
             let subtitle_id = next_subtitle_id;
             next_subtitle_id += 1;
@@ -278,13 +302,11 @@ async fn handle_mpv(
                 concat!(
                     "{{\"command\":[\"get_property\",\"sub-start\"],\"request_id\":{0}}}\n",
                     "{{\"command\":[\"get_property\",\"sub-end\"],\"request_id\":{1}}}\n",
-                    "{{\"command\":[\"get_property\",\"path\"],\"request_id\":{2}}}\n",
-                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{3}}}\n"
+                    "{{\"command\":[\"get_property\",\"aid\"],\"request_id\":{2}}}\n"
                 ),
                 base_id,
                 base_id + 1,
-                base_id + 2,
-                base_id + 3
+                base_id + 2
             );
 
             mpv.write_all(cmd.as_bytes()).await?;
@@ -298,21 +320,32 @@ async fn handle_client(
     stream: TcpStream,
     id: u64,
     state: Arc<SharedState>,
-    mut subtitle_rx: broadcast::Receiver<Subtitle>,
+    mut subtitle_rx: broadcast::Receiver<SubtitleEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
+    if let Some(path) = state.current_media_path.read().await.clone() {
+        let msg = serde_json::json!({ "type": "media_changed", "path": path });
+        ws_tx.send(Message::Text(msg.to_string().into())).await?;
+    }
+
     loop {
         tokio::select! {
-            Ok(sub) = subtitle_rx.recv() => {
-                let msg = serde_json::json!({
-                    "type": "subtitle",
-                    "id": sub.id,
-                    "subtitle": sub.text,
-                    "sub_start": sub.sub_start,
-                    "sub_end": sub.sub_end,
-                });
+            Ok(event) = subtitle_rx.recv() => {
+                let msg = match event {
+                    SubtitleEvent::New(sub) => serde_json::json!({
+                        "type": "subtitle",
+                        "id": sub.id,
+                        "subtitle": sub.text,
+                        "sub_start": sub.sub_start,
+                        "sub_end": sub.sub_end,
+                    }),
+                    SubtitleEvent::MediaChanged(path) => serde_json::json!({
+                        "type": "media_changed",
+                        "path": path,
+                    }),
+                };
                 ws_tx.send(Message::Text(msg.to_string().into())).await?;
             }
 

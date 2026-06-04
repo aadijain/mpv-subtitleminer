@@ -14,6 +14,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Anki integration via AnkiConnect: Select your note type, make a card and add media.
 - Replay sentences with audio anytime.
 - Custom regex to clean subtitle text (e.g. strip parentheticals) before display and Anki export.
+- Page title reflects the currently playing media file name.
 
 ## Downloads
 
