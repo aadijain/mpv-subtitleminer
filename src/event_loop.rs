@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -159,6 +159,10 @@ impl RecentSubtitles {
 struct SharedState {
     subtitles: RwLock<HashMap<u64, Subtitle>>,
     current_media_path: RwLock<Option<String>>,
+    /// Dedup set for the duplicate Dialogue lines mpv re-reports around overlaps.
+    /// Held here (not just in `handle_mpv`) so a client `clear` request can reset
+    /// it; reset on media change.
+    recent: Mutex<RecentSubtitles>,
 }
 
 impl SharedState {
@@ -166,6 +170,7 @@ impl SharedState {
         Arc::new(Self {
             subtitles: RwLock::new(HashMap::new()),
             current_media_path: RwLock::new(None),
+            recent: Mutex::new(RecentSubtitles::new(512)),
         })
     }
 }
@@ -330,9 +335,6 @@ async fn handle_mpv(
     let mut current_sub_delay: f64 = 0.0;
     let mut current_secondary_sub_delay: f64 = 0.0;
     let mut next_subtitle_id = 1u64;
-    // Drops the duplicate Dialogue lines mpv re-reports around overlaps; reset
-    // when the media file changes.
-    let mut recent = RecentSubtitles::new(512);
     let mut line = String::new();
 
     loop {
@@ -357,7 +359,7 @@ async fn handle_mpv(
                 let path = path.to_string();
                 if current_path.as_deref() != Some(&path) {
                     current_path = Some(path.clone());
-                    recent.clear();
+                    state.recent.lock().await.clear();
                     *state.current_media_path.write().await = Some(path.clone());
                     let _ = tx.send(SubtitleEvent::MediaChanged(path));
                 }
@@ -419,7 +421,7 @@ async fn handle_mpv(
             // same text recurring later stays a distinct row.
             let bucket = (raw_start * 1000.0).round() as i64 / DEDUP_BUCKET_MS;
             let key = (track, bucket, style.to_string(), name.to_string(), text.clone());
-            if !recent.insert(key) {
+            if !state.recent.lock().await.insert(key) {
                 continue;
             }
 
@@ -515,12 +517,20 @@ enum ProtocolRequest {
         offset_end: Option<f64>,
         audio_config: Option<crate::media::AudioConfig>,
     },
+    /// The UI "clear" button: reset the dedup set so already-seen subtitles can
+    /// stream in again (e.g. after clearing the screen and seeking back).
+    Clear,
 }
 
 async fn handle_request(text: &str, client_id: u64, state: &Arc<SharedState>) -> Option<String> {
     let request: ProtocolRequest = serde_json::from_str(text).ok()?;
 
     match request {
+        ProtocolRequest::Clear => {
+            state.recent.lock().await.clear();
+            info!("[client:{}] Cleared subtitle dedup set", client_id);
+            None
+        }
         ProtocolRequest::AudioRange {
             start_id,
             end_id,
