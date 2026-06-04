@@ -268,14 +268,21 @@
   )
 
   // Google-Calendar-style overlap layout: split a lane into side-by-side columns for
-  // overlapping events. Walk the time-sorted list into clusters (maximal runs that overlap),
-  // assign each block the leftmost free column within its cluster (first-fit), and tag every
-  // block with its column index + the cluster's total column count. CSS turns {col, cols} into
-  // an equal-width slice of the lane. cols === 1 means no overlap (full width).
+  // overlapping events. Walk the time-sorted list into clusters (maximal runs that overlap)
+  // and first-fit each block into the leftmost free column. Each column is then sized by how
+  // densely its text fills the available height (characters ÷ duration ≈ text per unit of the
+  // time-proportional block height), so every box comes out roughly full instead of some
+  // cramped and some half-empty. The px/sec zoom factor cancels under normalization, so widths
+  // stay stable across zoom. Returns per-block {left, width} as fractions of the lane's inner
+  // width; only blocks in a multi-column cluster are mapped (a lone block stays full width).
   interface BlockSlot {
-    col: number
-    cols: number
+    left: number // fraction of inner lane width
+    width: number
   }
+  // Text "fill demand": clamped char count over clamped duration. A wordy-but-brief line wants
+  // a wider column; a sparse-but-long one can stay narrow and still look full.
+  const fillWeight = (m: SubtitleMessage) =>
+    Math.min(80, Math.max(8, m.subtitle.length)) / Math.max(0.8, m.sub_end - m.sub_start)
   const layoutLane = (list: SubtitleMessage[]) => {
     const out = new Map<string, BlockSlot>()
     let cluster: SubtitleMessage[] = []
@@ -291,7 +298,25 @@
         colOf.set(m.uid, c)
       }
       const cols = colEnds.length
-      for (const m of cluster) out.set(m.uid, { col: colOf.get(m.uid) ?? 0, cols })
+      if (cols > 1) {
+        // Each column's weight = the most text any of its blocks carries.
+        const weight = Array.from({ length: cols }, () => 0)
+        for (const m of cluster) {
+          const c = colOf.get(m.uid) ?? 0
+          weight[c] = Math.max(weight[c] ?? 0, fillWeight(m))
+        }
+        const total = weight.reduce((a, b) => a + b, 0) || cols
+        const leftFrac: number[] = []
+        let acc = 0
+        for (let c = 0; c < cols; c++) {
+          leftFrac[c] = acc / total
+          acc += weight[c] ?? 0
+        }
+        for (const m of cluster) {
+          const c = colOf.get(m.uid) ?? 0
+          out.set(m.uid, { left: leftFrac[c] ?? 0, width: (weight[c] ?? 0) / total })
+        }
+      }
       cluster = []
       clusterEnd = -Infinity
     }
@@ -309,8 +334,7 @@
     for (const [uid, slot] of layoutLane(secondaryMessages.value)) map.set(uid, slot)
     return map
   })
-  const layoutOf = (m: SubtitleMessage): BlockSlot =>
-    blockLayout.value.get(m.uid) ?? { col: 0, cols: 1 }
+  const slotOf = (m: SubtitleMessage) => blockLayout.value.get(m.uid)
 
   // Vertical timeline: a shared time axis both columns are positioned against. Time runs at
   // `pixelsPerSecond` (configured in Settings → Display) EXCEPT inside long gaps with no subs
@@ -426,14 +450,14 @@
 
   const blockStyle = (m: SubtitleMessage) => {
     const top = yFor(m.sub_start)
-    const { col, cols } = layoutOf(m)
+    const slot = slotOf(m)
     const style: Record<string, string> = {
       top: `${top}px`,
       '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px`,
     }
-    if (cols > 1) {
-      style['--col'] = String(col)
-      style['--cols'] = String(cols)
+    if (slot) {
+      style['--left'] = String(slot.left)
+      style['--width'] = String(slot.width)
     }
     return style
   }
@@ -1353,7 +1377,7 @@
               v-for="message in primaryMessages"
               :key="message.uid"
               class="tl-block"
-              :class="{ sel: isSelected(message.uid), cal: layoutOf(message).cols > 1 }"
+              :class="{ sel: isSelected(message.uid), cal: !!slotOf(message) }"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
             >
@@ -1439,7 +1463,7 @@
               v-for="message in secondaryMessages"
               :key="message.uid"
               class="tl-block secondary"
-              :class="{ sel: isSelectedSecondary(message.uid), cal: layoutOf(message).cols > 1 }"
+              :class="{ sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) }"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
@@ -2366,12 +2390,12 @@
       width 0.12s ease;
   }
 
-  /* Calendar-style overlap: a block in a cluster of `--cols` overlapping events takes the
-     `--col`-th equal-width slice of the lane (16px = the 8px lane margins, 3px = inter-column
-     gap). Setting left+width means the base `right: 8px` is ignored. */
+  /* Calendar-style overlap: --left/--width are fractions of the lane's inner width (the
+     column was sized by its text amount). 16px = the 8px lane margins, 3px = inter-column gap.
+     Setting left+width means base `right: 8px` is ignored. */
   .tl-block.cal {
-    left: calc(8px + (100% - 16px) * var(--col, 0) / var(--cols, 1));
-    width: calc((100% - 16px) / var(--cols, 1) - 3px);
+    left: calc(8px + (100% - 16px) * var(--left, 0));
+    width: calc((100% - 16px) * var(--width, 1) - 3px);
   }
 
   .tl-block.sel {
