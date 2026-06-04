@@ -15,6 +15,8 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Replay sentences with audio anytime.
 - Custom regex to clean subtitle text (e.g. strip parentheticals) before display and Anki export.
 - Page title reflects the currently playing media file name.
+- Secondary subtitle support: stream mpv secondary subtitles and export them to Anki.
+- Timeline view: primary and secondary subs are displayed as parallel columns in a vertical timeline, each independently selectable.
 
 ## Downloads
 

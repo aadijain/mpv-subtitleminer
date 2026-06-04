@@ -1,6 +1,6 @@
 <script setup lang="ts">
   import MediaConfiguration from './components/MediaConfiguration.vue'
-  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
   import { useToast } from './composables/useToast'
   import { useWebSocket } from './composables/useWebSocket'
   import * as anki from './services/ankiConnect'
@@ -24,6 +24,7 @@
       noteType: '',
       frontField: '',
       sentenceField: '',
+      secondaryField: '',
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
@@ -31,10 +32,16 @@
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
       subtitleFontSize: 110,
+      secondaryFontSize: 95,
       mediaFilenameRegex: '^\\[.*?\\]\\s*|\\s*S\\d+E\\d+.*$',
       mediaFilenameRegexEnabled: true,
       sentenceCleanRegex: '\\(.*?\\)',
       sentenceCleanRegexEnabled: false,
+      secondaryCleanRegex: '\\(.*?\\)',
+      secondaryCleanRegexEnabled: false,
+      showSecondaryColumn: true,
+      timelineZoom: 80,
+      primaryColumnFraction: 0.5,
     },
     media: {
       audioOffsetStart: 0.25,
@@ -90,8 +97,8 @@
   )
 
   const ankiConfigured = computed(() => {
-    const { noteType, sentenceField, audioField, imageField } = settings.value.anki
-    return !!noteType && (!!sentenceField || !!audioField || !!imageField)
+    const { noteType, sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
   })
 
   const showSettings = ref(false)
@@ -114,10 +121,10 @@
     return model ? (modelsWithFields.value[model] ?? []) : []
   })
   const settingsValid = computed(() => {
-    const { noteType, sentenceField, audioField, imageField } = localSettings.value
+    const { noteType, sentenceField, secondaryField, audioField, imageField } = localSettings.value
     // Allow saving if Anki is not configured
     if (!noteType) return true
-    return !!sentenceField || !!audioField || !!imageField
+    return !!sentenceField || !!secondaryField || !!audioField || !!imageField
   })
 
   watch(showSettings, (isOpen) => {
@@ -168,6 +175,7 @@
       noteType: value,
       frontField: '',
       sentenceField: '',
+      secondaryField: '',
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
@@ -223,9 +231,12 @@
     showSettings.value = false
   }
 
+  type SubtitleTrack = 'primary' | 'secondary'
+
   interface SubtitleMessage {
     id: number
     subtitle: string
+    track: SubtitleTrack
     time_pos: number
     sub_start: number
     sub_end: number
@@ -236,16 +247,197 @@
   }
 
   const messages = ref<SubtitleMessage[]>([])
-  const bottomRef = ref<HTMLElement | null>(null)
-  const hoveredThumbnailUid = ref<string | null>(null)
+  const mainRef = ref<HTMLElement | null>(null)
   const loadingMedia = ref<Record<string, boolean>>({})
+  // Floating screenshot preview: anchored to the hovered block's screenshot button. Rendered
+  // via Teleport so it isn't clipped by the block's overflow. Shows once the thumbnail loads.
+  const thumbHover = ref<{ uid: string; top: number; left: number } | null>(null)
+  // Two independent selections, one per column. `selectedMessages` (primary) drives the
+  // existing Anki/media flow; `selectedSecondary` is display/selection only for now.
   const selectedMessages = ref<Set<string>>(new Set())
+  const selectedSecondary = ref<Set<string>>(new Set())
+
+  // Split the single message stream into two time-ordered columns by track.
+  const sortByTime = (a: SubtitleMessage, b: SubtitleMessage) =>
+    a.sub_start - b.sub_start || a.id - b.id
+  const primaryMessages = computed(() =>
+    messages.value.filter((m) => m.track === 'primary').sort(sortByTime),
+  )
+  const secondaryMessages = computed(() =>
+    messages.value.filter((m) => m.track === 'secondary').sort(sortByTime),
+  )
+
+  // Vertical timeline: a shared time axis both columns are positioned against. Time runs at
+  // `pixelsPerSecond` (configured in Settings → Display) EXCEPT inside long gaps with no subs
+  // in either column, which are capped at MAX_GAP_PX so silence / seek dead-zones don't waste
+  // space. The axis is therefore piecewise-linear (intentionally non-uniform).
+  const PPS_MIN = 30
+  const PPS_MAX = 240
+  const MAX_GAP_PX = 48
+  const pixelsPerSecond = computed(() => settings.value.display.timelineZoom)
+
+  const timelineBounds = computed(() => {
+    if (messages.value.length === 0) return { start: 0, end: 1 }
+    let start = Infinity
+    let end = -Infinity
+    for (const m of messages.value) {
+      if (m.sub_start < start) start = m.sub_start
+      if (m.sub_end > end) end = m.sub_end
+    }
+    return { start: Math.max(0, Math.floor(start)), end: Math.ceil(end) }
+  })
+
+  interface TimelineSegment {
+    t0: number
+    t1: number
+    y0: number
+    y1: number
+    capped: boolean // a gap whose height was clamped below true scale
+  }
+
+  // Build the piecewise time→pixel mapping: covered spans (any sub present) render at full
+  // scale; gaps render at min(trueHeight, MAX_GAP_PX).
+  const timeline = computed(() => {
+    const segs: TimelineSegment[] = []
+    if (messages.value.length === 0) return { segs, total: 0 }
+    const { start, end } = timelineBounds.value
+    const pps = pixelsPerSecond.value
+
+    const intervals = messages.value
+      .map((m) => ({ a: m.sub_start, b: m.sub_end }))
+      .sort((x, y) => x.a - y.a)
+    const covered: { a: number; b: number }[] = []
+    for (const iv of intervals) {
+      const last = covered[covered.length - 1]
+      if (!last || iv.a > last.b) covered.push({ a: iv.a, b: Math.max(iv.b, iv.a) })
+      else last.b = Math.max(last.b, iv.b)
+    }
+
+    let y = 0
+    let cursor = start
+    const push = (t0: number, t1: number, isGap: boolean) => {
+      if (t1 <= t0) return
+      const trueHeight = (t1 - t0) * pps
+      const capped = isGap && trueHeight > MAX_GAP_PX
+      const h = capped ? MAX_GAP_PX : trueHeight
+      segs.push({ t0, t1, y0: y, y1: y + h, capped })
+      y += h
+    }
+    for (const span of covered) {
+      if (span.a > cursor) push(cursor, span.a, true)
+      push(Math.max(span.a, cursor), span.b, false)
+      cursor = Math.max(cursor, span.b)
+    }
+    if (end > cursor) push(cursor, end, true)
+    return { segs, total: y }
+  })
+
+  const timelineHeight = computed(() => timeline.value.total)
+
+  const yFor = (t: number) => {
+    const { segs } = timeline.value
+    const first = segs[0]
+    const lastSeg = segs[segs.length - 1]
+    if (!first || !lastSeg) return 0
+    if (t <= first.t0) return first.y0
+    for (const s of segs) {
+      if (t <= s.t1) {
+        const f = s.t1 === s.t0 ? 0 : (t - s.t0) / (s.t1 - s.t0)
+        return s.y0 + f * (s.y1 - s.y0)
+      }
+    }
+    return lastSeg.y1
+  }
+
+  const segmentAt = (t: number) => timeline.value.segs.find((s) => t >= s.t0 && t <= s.t1)
+
+  const tickStep = computed(() => {
+    const target = 64 / pixelsPerSecond.value // aim for ~64px between gutter ticks
+    return [1, 2, 5, 10, 15, 20, 30, 60, 120, 300].find((s) => s >= target) ?? 600
+  })
+  // Ticks at nice intervals, positioned via the piecewise map. Skip any that land inside a
+  // capped gap (that range is collapsed and gets a "gap" marker instead).
+  const ticks = computed(() => {
+    const { start, end } = timelineBounds.value
+    const step = tickStep.value
+    const out: { t: number; y: number }[] = []
+    for (let t = Math.ceil(start / step) * step; t <= end; t += step) {
+      if (segmentAt(t)?.capped) continue
+      out.push({ t, y: yFor(t) })
+    }
+    return out
+  })
+
+  // Collapsed gaps get a labelled marker spanning their (clamped) height.
+  const gapMarkers = computed(() =>
+    timeline.value.segs
+      .filter((s) => s.capped)
+      .map((s) => {
+        const secs = Math.round(s.t1 - s.t0)
+        const label = secs >= 60 ? `⋯ ${Math.floor(secs / 60)}m ${secs % 60}s` : `⋯ ${secs}s`
+        return { top: s.y0, height: s.y1 - s.y0, label }
+      }),
+  )
+
+  const blockStyle = (m: SubtitleMessage) => {
+    const top = yFor(m.sub_start)
+    return { top: `${top}px`, '--tl-h': `${Math.max(40, yFor(m.sub_end) - top)}px` }
+  }
+  const fmtTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`
+
+  // Drag-to-resize the split between the primary and secondary lanes. The boundary is stored as
+  // `primaryColumnFraction` (primary's share of the width after the fixed 56px time gutter) and
+  // drives the `--primary-frac` CSS var; clamped so neither column can be dragged away entirely.
+  const GUTTER_PX = 56
+  const COLUMN_FRAC_MIN = 0.2
+  const COLUMN_FRAC_MAX = 0.8
+  const tlBodyRef = ref<HTMLElement | null>(null)
+  const columnDragging = ref(false)
+
+  function startColumnDrag(e: PointerEvent) {
+    const body = tlBodyRef.value
+    if (!body) return
+    e.preventDefault()
+    const handle = e.currentTarget as HTMLElement
+    handle.setPointerCapture(e.pointerId)
+    columnDragging.value = true
+    const onMove = (ev: PointerEvent) => {
+      const rect = body.getBoundingClientRect()
+      const inner = rect.width - GUTTER_PX
+      if (inner <= 0) return
+      const frac = (ev.clientX - rect.left - GUTTER_PX) / inner
+      settings.value.display.primaryColumnFraction = Math.min(
+        COLUMN_FRAC_MAX,
+        Math.max(COLUMN_FRAC_MIN, frac),
+      )
+    }
+    const onUp = (ev: PointerEvent) => {
+      columnDragging.value = false
+      handle.releasePointerCapture(ev.pointerId)
+      handle.removeEventListener('pointermove', onMove)
+      handle.removeEventListener('pointerup', onUp)
+      handle.removeEventListener('pointercancel', onUp)
+    }
+    handle.addEventListener('pointermove', onMove)
+    handle.addEventListener('pointerup', onUp)
+    handle.addEventListener('pointercancel', onUp)
+  }
+
+  // Scroll so the given subtitle sits just below the sticky header. The header's own height
+  // cancels out (it occupies the top of the scroll content), so the target is simply its
+  // y-offset on the time axis minus a small margin.
+  const scrollToSubtitle = (msg: SubtitleMessage) => {
+    const el = mainRef.value
+    if (!el) return
+    el.scrollTop = Math.max(0, yFor(msg.sub_start) - 16)
+  }
 
   // Wipes the displayed subtitles and the current selection. Does NOT touch the page title -
   // callers that need to retitle (e.g. a media change) do so themselves.
   function clearMessages() {
     messages.value = []
     selectedMessages.value = new Set()
+    selectedSecondary.value = new Set()
   }
 
   function titleFromMediaPath(mediaPath: string): string {
@@ -262,14 +454,23 @@
     return title.trim()
   }
 
-  function cleanSentence(text: string): string {
-    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
-    if (!sentenceCleanRegexEnabled || !sentenceCleanRegex) return text
+  function applyCleanRegex(text: string, pattern: string, enabled: boolean): string {
+    if (!enabled || !pattern) return text
     try {
-      return text.replace(new RegExp(sentenceCleanRegex, 'gm'), '').trim()
+      return text.replace(new RegExp(pattern, 'gm'), '').trim()
     } catch {
       return text
     }
+  }
+
+  function cleanSentence(text: string): string {
+    const { sentenceCleanRegex, sentenceCleanRegexEnabled } = settings.value.display
+    return applyCleanRegex(text, sentenceCleanRegex, sentenceCleanRegexEnabled)
+  }
+
+  function cleanSecondary(text: string): string {
+    const { secondaryCleanRegex, secondaryCleanRegexEnabled } = settings.value.display
+    return applyCleanRegex(text, secondaryCleanRegex, secondaryCleanRegexEnabled)
   }
   const currentAudio = ref<HTMLAudioElement | null>(null)
   const pendingAudioRange = ref<{
@@ -340,7 +541,9 @@
         if (!msg) return
         messages.value.push(msg)
         if (messages.value.length > 200) messages.value.shift()
-        void nextTick(() => bottomRef.value?.scrollIntoView({ block: 'end' }))
+        // Follow the newest subtitle (works whether playback advanced or seeked), rather than
+        // always jumping to the bottom of the time axis.
+        void nextTick(() => scrollToSubtitle(msg))
         return
       }
 
@@ -426,8 +629,18 @@
       return null
     }
     const normalizedTimePos = time_pos ?? sub_start
+    const track: SubtitleTrack = d.track === 'secondary' ? 'secondary' : 'primary'
     const uid = `${port}-${id}`
-    return { id, subtitle, time_pos: normalizedTimePos, sub_start, sub_end, sourcePort: port, uid }
+    return {
+      id,
+      subtitle,
+      track,
+      time_pos: normalizedTimePos,
+      sub_start,
+      sub_end,
+      sourcePort: port,
+      uid,
+    }
   }
 
   function parseMediaMessage(d: JsonObject): { id: number; data: string } | null {
@@ -448,46 +661,54 @@
   }
 
   const isSelected = (uid: string) => selectedMessages.value.has(uid)
+  const isSelectedSecondary = (uid: string) => selectedSecondary.value.has(uid)
 
-  const toggleSelection = (msg: SubtitleMessage, index: number) => {
-    const id = msg.uid
-    const selected = selectedMessages.value
-
-    if (selected.has(id)) {
-      const selectedIndices = Array.from(selected)
-        .map((selId) => messages.value.findIndex((m) => m.uid === selId))
+  // Sequential/contiguous selection within a single column's time-ordered list: clicking
+  // grows or shrinks one run from either end (mirrors the original single-list behaviour).
+  const toggleInColumn = (
+    target: Ref<Set<string>>,
+    list: SubtitleMessage[],
+    msg: SubtitleMessage,
+  ) => {
+    const index = list.findIndex((m) => m.uid === msg.uid)
+    if (index === -1) return
+    const selected = new Set(target.value)
+    const selectedIndices = () =>
+      Array.from(selected)
+        .map((uid) => list.findIndex((m) => m.uid === uid))
         .filter((i) => i !== -1)
         .sort((a, b) => a - b)
 
-      if (index === selectedIndices[0] || index === selectedIndices[selectedIndices.length - 1]) {
-        selected.delete(id)
-      }
+    if (selected.has(msg.uid)) {
+      const idx = selectedIndices()
+      if (index === idx[0] || index === idx[idx.length - 1]) selected.delete(msg.uid)
+    } else if (selected.size === 0) {
+      selected.add(msg.uid)
     } else {
-      if (selected.size === 0) {
-        selected.add(id)
-      } else {
-        const selectedIndices = Array.from(selected)
-          .map((selId) => messages.value.findIndex((m) => m.uid === selId))
-          .filter((i) => i !== -1)
-          .sort((a, b) => a - b)
-
-        const minIdx = selectedIndices[0] ?? index
-        const maxIdx = selectedIndices[selectedIndices.length - 1] ?? index
-
-        if (index === minIdx - 1 || index === maxIdx + 1) {
-          selected.add(id)
-        }
-      }
+      const idx = selectedIndices()
+      const minIdx = idx[0] ?? index
+      const maxIdx = idx[idx.length - 1] ?? index
+      if (index === minIdx - 1 || index === maxIdx + 1) selected.add(msg.uid)
     }
-    selectedMessages.value = new Set(selected)
+    target.value = selected
   }
+
+  const togglePrimary = (msg: SubtitleMessage) =>
+    toggleInColumn(selectedMessages, primaryMessages.value, msg)
+  const toggleSecondary = (msg: SubtitleMessage) =>
+    toggleInColumn(selectedSecondary, secondaryMessages.value, msg)
 
   const clearSelection = () => {
     selectedMessages.value = new Set()
+    selectedSecondary.value = new Set()
   }
 
   const getSelectedMessages = (): SubtitleMessage[] => {
-    return messages.value.filter((m) => selectedMessages.value.has(m.uid))
+    return primaryMessages.value.filter((m) => selectedMessages.value.has(m.uid))
+  }
+
+  const getSelectedSecondaryMessages = (): SubtitleMessage[] => {
+    return secondaryMessages.value.filter((m) => selectedSecondary.value.has(m.uid))
   }
 
   const getSelectionRange = (): { first: SubtitleMessage; last: SubtitleMessage } | null => {
@@ -495,8 +716,8 @@
     if (selected.length === 0) return null
 
     const sorted = selected.sort((a, b) => {
-      const aIdx = messages.value.findIndex((m) => m.uid === a.uid)
-      const bIdx = messages.value.findIndex((m) => m.uid === b.uid)
+      const aIdx = primaryMessages.value.findIndex((m) => m.uid === a.uid)
+      const bIdx = primaryMessages.value.findIndex((m) => m.uid === b.uid)
       return aIdx - bIdx
     })
 
@@ -526,7 +747,10 @@
   })
 
   const updateTargetCardPreview = async () => {
-    if (selectedMessages.value.size === 0 || !ankiConfigured.value) {
+    if (
+      (selectedMessages.value.size === 0 && selectedSecondary.value.size === 0) ||
+      !ankiConfigured.value
+    ) {
       targetCardPreview.value = null
       return
     }
@@ -564,7 +788,7 @@
   }
 
   watch(
-    () => selectedMessages.value.size,
+    () => selectedMessages.value.size + selectedSecondary.value.size,
     () => updateTargetCardPreview(),
     { immediate: true },
   )
@@ -613,6 +837,37 @@
     }
     loadingMedia.value[key] = true
   }
+
+  // Click the screenshot button to request it; hovering shows a floating preview once loaded.
+  const onThumbButtonClick = (msg: SubtitleMessage, e: MouseEvent) => {
+    requestThumbnail(msg)
+    setThumbHover(msg, e)
+  }
+
+  const setThumbHover = (msg: SubtitleMessage, e: MouseEvent) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    thumbHover.value = {
+      uid: msg.uid,
+      top: Math.min(rect.bottom + 8, window.innerHeight - 256),
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - 432)),
+    }
+  }
+
+  const clearThumbHover = (uid: string) => {
+    if (thumbHover.value?.uid === uid) thumbHover.value = null
+  }
+
+  const thumbPreview = computed(() => {
+    const hover = thumbHover.value
+    if (!hover) return null
+    const msg = messages.value.find((m) => m.uid === hover.uid)
+    if (!msg?.thumbnail) return null
+    return {
+      src: `data:image/${settings.value.media.imageFormat};base64,${msg.thumbnail}`,
+      top: hover.top,
+      left: hover.left,
+    }
+  })
 
   const requestAudio = (msg: SubtitleMessage) => {
     if (ws.status.value !== 'connected') return
@@ -698,23 +953,24 @@
   }
 
   const sendSelectionToAnki = async () => {
-    const selectedMsgs = getSelectedMessages()
-    if (!ankiConfigured.value || selectedMsgs.length === 0) return
+    const primaryMsgs = getSelectedMessages()
+    const secondaryMsgs = getSelectedSecondaryMessages()
+    if (!ankiConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0)) return
 
-    const { sentenceField, audioField, imageField } = settings.value.anki
-    const { first, last } = getSelectionRange() ?? {}
-    if (!first || !last) return
+    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    const range = getSelectionRange() // primary first/last (audio/image come from primary)
+    const first = range?.first
+    const last = range?.last
 
-    const primaryKey = first.uid
-    const primaryId = first.id
-    sendingToAnki.value[primaryKey] = true
-    ankiError.value[primaryKey] = ''
+    // State is tracked against an anchor: the primary selection if any, else the secondary.
+    const anchor = primaryMsgs[0] ?? secondaryMsgs[0]
+    if (!anchor) return
+    const anchorKey = anchor.uid
+    const mediaId = first?.id ?? anchor.id
+    sendingToAnki.value[anchorKey] = true
+    ankiError.value[anchorKey] = ''
 
     try {
-      if (!ankiConfigured.value) {
-        throw new Error('Anki settings are incomplete')
-      }
-
       const targetNote = await anki.getLastNote(settings.value.anki.noteType)
       if (!targetNote) {
         throw new Error('No target card found in Anki')
@@ -733,44 +989,50 @@
 
       const fieldUpdates: Record<string, string> = {}
 
-      if (sentenceField) {
-        const text = selectedMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
-        const existingSentence = targetNote.fields[sentenceField]?.value ?? ''
-        fieldUpdates[sentenceField] = preserveHtmlTags(existingSentence, text)
+      if (sentenceField && primaryMsgs.length > 0) {
+        const text = primaryMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
+        const existing = targetNote.fields[sentenceField]?.value ?? ''
+        fieldUpdates[sentenceField] = preserveHtmlTags(existing, text)
       }
 
-      if (audioField) {
-        if (selectedMsgs.length > 1) {
+      if (secondaryField && secondaryMsgs.length > 0) {
+        const text = secondaryMsgs.map((m) => cleanSecondary(m.subtitle)).join(' ')
+        const existing = targetNote.fields[secondaryField]?.value ?? ''
+        fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
+      }
+
+      if (audioField && first && last) {
+        if (primaryMsgs.length > 1) {
           const selectionPort = first.sourcePort
-          const allSamePort = selectedMsgs.every((msg) => msg.sourcePort === selectionPort)
+          const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
           if (!allSamePort) {
             throw new Error('Selected subtitles must come from the same connection for audio.')
           }
         }
-        let audioData =
-          selectedMsgs.length > 1
+        const audioData =
+          primaryMsgs.length > 1
             ? await requestAudioRange(first.id, last.id, first.sourcePort)
             : first.audio || (await requestMediaFromServer(first, 'audio'))
 
         if (audioData) {
-          const filename = generateMediaFilename(primaryId, 'audio')
+          const filename = generateMediaFilename(mediaId, 'audio')
           await anki.storeMediaFile(filename, audioData)
           fieldUpdates[audioField] = `[sound:${filename}]`
         }
       }
 
-      if (imageField) {
-        let imageData = selectedMsgs.length === 1 ? first.thumbnail : undefined
+      if (imageField && first && last) {
+        let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
 
         if (!imageData) {
           imageData = await requestMediaFromServer(
             first,
             'thumbnail',
-            selectedMsgs.length > 1 ? last.id : undefined,
+            primaryMsgs.length > 1 ? last.id : undefined,
           )
         }
         if (imageData) {
-          const filename = generateMediaFilename(primaryId, 'image')
+          const filename = generateMediaFilename(mediaId, 'image')
           await anki.storeMediaFile(filename, imageData)
           fieldUpdates[imageField] = `<img src="${filename}">`
         }
@@ -778,9 +1040,10 @@
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
-        ankiSuccess.value[primaryKey] = true
+        ankiSuccess.value[anchorKey] = true
         const noteId = targetNote.noteId
-        toast.success(`Added ${selectedMsgs.length} subtitle(s) to Anki`, {
+        const count = primaryMsgs.length + secondaryMsgs.length
+        toast.success(`Added ${count} subtitle(s) to Anki`, {
           duration: 5000,
           action: {
             label: 'Browse',
@@ -791,15 +1054,15 @@
         })
 
         setTimeout(() => {
-          delete ankiSuccess.value[primaryKey]
+          delete ankiSuccess.value[anchorKey]
           clearSelection()
         }, 2000)
       }
     } catch (err) {
-      ankiError.value[primaryKey] = err instanceof Error ? err.message : 'Unknown error'
+      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
       toast.error(err instanceof Error ? err.message : 'Failed to add to Anki')
     } finally {
-      delete sendingToAnki.value[primaryKey]
+      delete sendingToAnki.value[anchorKey]
     }
   }
 
@@ -966,120 +1229,185 @@
       </div>
     </header>
 
-    <main class="main">
+    <main ref="mainRef" class="main">
       <div v-if="messages.length === 0" class="empty">Waiting for subtitles...</div>
-      <ul v-else class="messages">
-        <li
-          v-for="(message, index) in messages"
-          :key="message.uid"
-          class="message-row"
-          :class="{ selected: isSelected(message.uid) }"
-          @click="toggleSelection(message, index)"
-        >
-          <span
-            class="subtitle-text"
-            :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
-            >{{ cleanSentence(message.subtitle) }}</span
-          >
-          <div class="actions">
-            <div class="thumb-action">
-              <button
-                class="icon-btn"
-                :class="{
-                  loading: loadingMedia[`thumb-${message.uid}`],
-                  active: message.thumbnail,
-                }"
-                title="Screenshot"
-                @click.stop="requestThumbnail(message)"
-                @mouseenter="hoveredThumbnailUid = message.uid"
-                @mouseleave="
-                  () => {
-                    if (hoveredThumbnailUid === message.uid) {
-                      hoveredThumbnailUid = null
-                    }
-                  }
-                "
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                  <circle cx="8.5" cy="8.5" r="1.5" />
-                  <polyline points="21 15 16 10 5 21" />
-                </svg>
-              </button>
-              <div
-                v-if="hoveredThumbnailUid === message.uid && message.thumbnail"
-                class="thumb-preview"
-              >
-                <img
-                  :src="`data:image/${settings.media.imageFormat};base64,${message.thumbnail}`"
-                  alt="Thumbnail"
-                />
-              </div>
-            </div>
+      <div
+        v-else
+        class="timeline"
+        :class="{ 'hide-secondary': !settings.display.showSecondaryColumn }"
+        :style="{ '--primary-frac': settings.display.primaryColumnFraction }"
+      >
+        <div class="tl-head">
+          <div class="tl-head-gutter">time</div>
+          <div class="tl-head-col primary">
+            <span>Primary</span>
             <button
-              class="icon-btn"
-              :class="{ loading: loadingMedia[`audio-${message.uid}`], active: message.audio }"
-              title="Play audio"
-              @click.stop="requestAudio(message)"
+              v-if="!settings.display.showSecondaryColumn"
+              class="tl-head-toggle"
+              type="button"
+              title="Show secondary column"
+              @click="settings.display.showSecondaryColumn = true"
             >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-              </svg>
+              + Secondary
             </button>
           </div>
-          <button
-            v-if="selectionRangeAnchorUid === message.uid"
-            class="icon-btn range-audio-btn"
-            :class="{ loading: selectionAudioLoading }"
-            :disabled="selectionAudioLoading"
-            title="Play selected range"
-            @click.stop="requestSelectionAudioRange"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
+          <div class="tl-head-col secondary">
+            <span>Secondary</span>
+            <button
+              class="tl-head-toggle"
+              type="button"
+              title="Hide secondary column"
+              @click="settings.display.showSecondaryColumn = false"
             >
-              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-            </svg>
-          </button>
-        </li>
-      </ul>
-      <div ref="bottomRef" class="bottom-anchor" aria-hidden="true"></div>
+              Hide
+            </button>
+          </div>
+          <div
+            class="tl-divider"
+            :class="{ dragging: columnDragging }"
+            title="Drag to resize columns"
+            @pointerdown="startColumnDrag"
+          ></div>
+        </div>
+
+        <div ref="tlBodyRef" class="tl-body" :style="{ height: `${timelineHeight}px` }">
+          <div class="tl-gutter">
+            <div
+              v-for="tick in ticks"
+              :key="tick.t"
+              class="tl-tick"
+              :style="{ top: `${tick.y}px` }"
+            >
+              <span class="tl-tick-label">{{ fmtTime(tick.t) }}</span>
+            </div>
+          </div>
+
+          <div
+            v-for="(gap, i) in gapMarkers"
+            :key="`gap-${i}`"
+            class="tl-gap"
+            :style="{ top: `${gap.top}px`, height: `${gap.height}px` }"
+          >
+            <span class="tl-gap-label">{{ gap.label }}</span>
+          </div>
+
+          <div class="tl-lane primary">
+            <div
+              v-for="message in primaryMessages"
+              :key="message.uid"
+              class="tl-block"
+              :class="{ sel: isSelected(message.uid) }"
+              :style="blockStyle(message)"
+              @click="togglePrimary(message)"
+            >
+              <span
+                class="tl-text"
+                :style="{ fontSize: settings.display.subtitleFontSize + '%' }"
+                >{{ cleanSentence(message.subtitle) }}</span
+              >
+              <div class="tl-actions">
+                <button
+                  class="icon-btn compact"
+                  :class="{
+                    loading: loadingMedia[`thumb-${message.uid}`],
+                    active: message.thumbnail,
+                  }"
+                  title="Screenshot (hover to preview)"
+                  @click.stop="onThumbButtonClick(message, $event)"
+                  @mouseenter="setThumbHover(message, $event)"
+                  @mouseleave="clearThumbHover(message.uid)"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <polyline points="21 15 16 10 5 21" />
+                  </svg>
+                </button>
+                <button
+                  class="icon-btn compact"
+                  :class="{ loading: loadingMedia[`audio-${message.uid}`], active: message.audio }"
+                  title="Play audio"
+                  @click.stop="requestAudio(message)"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                </button>
+                <button
+                  v-if="selectionRangeAnchorUid === message.uid"
+                  class="icon-btn compact"
+                  :class="{ loading: selectionAudioLoading }"
+                  :disabled="selectionAudioLoading"
+                  title="Play selected range"
+                  @click.stop="requestSelectionAudioRange"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tl-lane secondary">
+            <div
+              v-for="message in secondaryMessages"
+              :key="message.uid"
+              class="tl-block secondary"
+              :class="{ sel: isSelectedSecondary(message.uid) }"
+              :style="blockStyle(message)"
+              @click="toggleSecondary(message)"
+            >
+              <span
+                class="tl-text"
+                :style="{ fontSize: settings.display.secondaryFontSize + '%' }"
+                >{{ cleanSecondary(message.subtitle) }}</span
+              >
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
 
     <div
       ref="selectionBarRef"
       class="selection-bar"
-      :class="{ inactive: selectedMessages.size === 0 }"
+      :class="{ inactive: selectedMessages.size === 0 && selectedSecondary.size === 0 }"
     >
       <div class="selection-left">
-        <template v-if="selectedMessages.size > 0">
-          <span class="selection-count">{{ selectedMessages.size }} selected</span>
+        <template v-if="selectedMessages.size > 0 || selectedSecondary.size > 0">
+          <span class="selection-count">
+            {{ selectedMessages.size }} primary
+            <span class="selection-sub">· {{ selectedSecondary.size }} secondary</span>
+          </span>
           <span v-if="loadingTargetCard" class="target-card loading">Loading card...</span>
           <span v-else-if="targetCardPreview" class="target-card" title="Target card">
             → {{ targetCardPreview }}
@@ -1091,20 +1419,32 @@
       <div class="selection-right">
         <button
           class="selection-btn send-btn"
-          :disabled="!targetCardPreview || selectedMessages.size === 0"
+          :disabled="
+            !targetCardPreview || (selectedMessages.size === 0 && selectedSecondary.size === 0)
+          "
           @click="sendSelectionToAnki"
         >
           📝 Add to Anki
         </button>
         <button
           class="selection-btn clear-btn"
-          :disabled="selectedMessages.size === 0"
+          :disabled="selectedMessages.size === 0 && selectedSecondary.size === 0"
           @click="clearSelection"
         >
           ✕ Clear
         </button>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="thumbPreview"
+        class="thumb-preview-float"
+        :style="{ top: `${thumbPreview.top}px`, left: `${thumbPreview.left}px` }"
+      >
+        <img :src="thumbPreview.src" alt="Screenshot preview" />
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div v-if="showSettings" class="modal-overlay" @click.self="cancelSettings">
@@ -1222,6 +1562,24 @@
                         {{ field }}
                       </option>
                     </select>
+                    <small class="field-hint">Filled from the primary column selection</small>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Secondary sentence field</span>
+                    <select
+                      :value="localSettings.secondaryField"
+                      @change="
+                        (e) =>
+                          onFieldChange('secondaryField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't update</option>
+                      <option v-for="field in availableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                    <small class="field-hint">Filled from the secondary column selection</small>
                   </label>
 
                   <label class="form-group">
@@ -1285,7 +1643,7 @@
               </div>
               <div class="form-grid">
                 <label class="form-group">
-                  <span>Subtitle font size ({{ localDisplay.subtitleFontSize }}%)</span>
+                  <span>Primary font size ({{ localDisplay.subtitleFontSize }}%)</span>
                   <input
                     type="range"
                     min="70"
@@ -1303,6 +1661,46 @@
                   <div class="range-labels">
                     <span>70%</span>
                     <span>200%</span>
+                  </div>
+                </label>
+                <label class="form-group">
+                  <span>Secondary font size ({{ localDisplay.secondaryFontSize }}%)</span>
+                  <input
+                    type="range"
+                    min="70"
+                    max="200"
+                    step="5"
+                    :value="localDisplay.secondaryFontSize"
+                    class="range-input"
+                    @input="
+                      (e) =>
+                        (localDisplay.secondaryFontSize = parseInt(
+                          (e.target as HTMLInputElement).value,
+                        ))
+                    "
+                  />
+                  <div class="range-labels">
+                    <span>70%</span>
+                    <span>200%</span>
+                  </div>
+                </label>
+                <label class="form-group">
+                  <span>Timeline zoom</span>
+                  <input
+                    type="range"
+                    :min="PPS_MIN"
+                    :max="PPS_MAX"
+                    step="5"
+                    :value="localDisplay.timelineZoom"
+                    class="range-input"
+                    @input="
+                      (e) =>
+                        (localDisplay.timelineZoom = parseInt((e.target as HTMLInputElement).value))
+                    "
+                  />
+                  <div class="range-labels">
+                    <span>Out</span>
+                    <span>In</span>
                   </div>
                 </label>
               </div>
@@ -1327,7 +1725,7 @@
                         "
                       />
                     </label>
-                    Sentence clean regex
+                    Primary clean regex
                   </span>
                   <input
                     type="text"
@@ -1340,8 +1738,39 @@
                     "
                   />
                   <small class="field-hint"
-                    >Applied to subtitle text. Matches are stripped. Affects display and Anki
-                    export.</small
+                    >Applied to primary subtitle text. Matches are stripped. Affects display and
+                    Anki export.</small
+                  >
+                </label>
+                <label class="form-group" style="grid-column: 1 / -1">
+                  <span class="label-with-toggle">
+                    <label class="toggle-label">
+                      <input
+                        type="checkbox"
+                        :checked="localDisplay.secondaryCleanRegexEnabled"
+                        @change="
+                          (e) =>
+                            (localDisplay.secondaryCleanRegexEnabled = (
+                              e.target as HTMLInputElement
+                            ).checked)
+                        "
+                      />
+                    </label>
+                    Secondary clean regex
+                  </span>
+                  <input
+                    type="text"
+                    :value="localDisplay.secondaryCleanRegex"
+                    :disabled="!localDisplay.secondaryCleanRegexEnabled"
+                    placeholder="e.g. \(.*?\) to strip bracketed notes"
+                    @input="
+                      (e) =>
+                        (localDisplay.secondaryCleanRegex = (e.target as HTMLInputElement).value)
+                    "
+                  />
+                  <small class="field-hint"
+                    >Applied to secondary subtitle text. Matches are stripped. Affects display and
+                    Anki export.</small
                   >
                 </label>
                 <label class="form-group" style="grid-column: 1 / -1">
@@ -1441,7 +1870,8 @@
   }
 
   .app {
-    min-height: 100vh;
+    height: 100vh;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }
@@ -1641,72 +2071,335 @@
 
   .main {
     flex: 1;
-    padding: 16px;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0;
     padding-bottom: calc(var(--selection-bar-height, 72px) + 16px);
   }
 
   .empty {
     color: #6c7687;
-    padding: 0 8px;
+    padding: 16px;
     font-size: 1.05em;
   }
 
-  .messages {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  .bottom-anchor {
-    scroll-margin-bottom: calc(var(--selection-bar-height, 72px) + 16px);
-  }
-
-  .message-row {
+  /* ── two-column vertical timeline ─────────────────────────────── */
+  .timeline {
     position: relative;
+  }
+
+  .tl-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    background: #1b1f26;
+    border-bottom: 1px solid #252b34;
+    font-size: 0.76em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #7c8aa1;
+  }
+
+  .tl-head-gutter {
+    flex: none;
+    width: 56px;
+    padding: 9px 0 9px 10px;
+  }
+
+  .tl-head-col {
+    flex: 1;
     display: flex;
     align-items: center;
-    gap: 16px;
-    padding: 14px 0;
-    border-bottom: 1px solid #202630;
-    cursor: pointer;
-    transition: background-color 0.15s ease;
-  }
-
-  .message-row:hover {
-    background: rgba(255, 255, 255, 0.04);
-  }
-
-  .message-row.selected {
-    background: rgba(90, 154, 202, 0.15);
-    border-left: 3px solid #5a9aca;
-    padding-left: 13px;
-  }
-
-  .subtitle-text {
-    flex: 0 1 auto;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 5px 10px 5px 14px;
     min-width: 0;
-    font-size: 1.1em;
-    line-height: 1.6;
+  }
+
+  /* Header columns must use the SAME geometry as the lanes/divider below (which position by
+     calc((100% - 56px) * frac)), not flex proportions: each column's fixed padding + the 1px
+     inter-column border don't scale with the fraction, so a flex split only lines up near
+     frac=0.5 and drifts ~15px at the extremes. Give primary the exact calc width and let
+     secondary fill the rest; box-sizing:border-box keeps padding/border inside the box. */
+  .tl-head-col.primary {
+    flex: none;
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
+  }
+
+  .tl-head-col.secondary {
+    flex: 1 1 0;
+  }
+
+  .tl-head-col + .tl-head-col {
+    border-left: 1px solid #252b34;
+  }
+
+  .tl-head-toggle {
+    border: 1px solid #2f3742;
+    background: #232934;
+    color: #a7b4c7;
+    font: inherit;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    padding: 3px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .tl-head-toggle:hover {
+    background: #2e3643;
+    color: #e9edf2;
+  }
+
+  .tl-body {
+    position: relative;
+  }
+
+  .tl-gutter {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 56px;
+    border-right: 1px solid #202630;
+  }
+
+  .tl-tick {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-top: 1px solid #1c222b;
+  }
+
+  .tl-tick-label {
+    position: absolute;
+    top: -0.62em;
+    left: 8px;
+    padding-right: 4px;
+    background: #14171c;
+    color: #6c7687;
+    font-size: 0.72em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* collapsed-gap marker (a deliberate break in the time axis), centered within the
+     primary column to match .tl-lane.primary geometry */
+  .tl-gap {
+    position: absolute;
+    left: 56px;
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #5b6472;
+    font-size: 0.72em;
+    letter-spacing: 0.05em;
+  }
+
+  .tl-gap::before,
+  .tl-gap::after {
+    content: '';
+    flex: 1;
+    border-top: 1px dashed #2a313c;
+    margin: 0 12px;
+  }
+
+  .tl-gap-label {
+    background: #14171c;
+    padding: 0 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tl-lane {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+  }
+
+  .tl-lane.primary {
+    left: 56px;
+    width: calc((100% - 56px) * var(--primary-frac, 0.5));
+    border-right: 1px solid #202630;
+  }
+
+  .tl-lane.secondary {
+    left: calc(56px + (100% - 56px) * var(--primary-frac, 0.5));
+    right: 0;
+  }
+
+  /* Draggable boundary in the header row, sitting at the column split (aligned with the lane
+     border below it). Spans the header height only. Hidden when secondary is collapsed. */
+  .tl-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(56px + (100% - 56px) * var(--primary-frac, 0.5));
+    width: 11px;
+    transform: translateX(-50%);
+    z-index: 7;
+    cursor: col-resize;
+    touch-action: none;
+  }
+
+  .tl-divider::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
+    background: transparent;
+    transition: background 0.15s ease;
+  }
+
+  .tl-divider:hover::before,
+  .tl-divider.dragging::before {
+    background: #5a9aca;
+  }
+
+  .timeline.hide-secondary .tl-divider {
+    display: none;
+  }
+
+  /* secondary column hidden: primary lane spans the full width */
+  .timeline.hide-secondary .tl-head-col.secondary,
+  .timeline.hide-secondary .tl-lane.secondary {
+    display: none;
+  }
+
+  /* With the secondary col gone, drop the fixed calc width and let primary fill the row
+     (otherwise the "+ Secondary" button is stranded mid-row at the old split). */
+  .timeline.hide-secondary .tl-head-col.primary {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .timeline.hide-secondary .tl-lane.primary,
+  .timeline.hide-secondary .tl-gap {
+    width: auto;
+    right: 0;
+    border-right: none;
+  }
+
+  .tl-block {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    /* time-proportional height as a variable so :hover can override it to fit the text */
+    height: var(--tl-h);
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 7px 9px;
+    border: 1px solid #232a33;
+    border-radius: 8px;
+    background: #1b1f26;
+    cursor: pointer;
+    overflow: hidden;
+    transition:
+      background 0.15s ease,
+      border-color 0.15s ease;
+  }
+
+  .tl-block.sel {
+    background: rgba(90, 154, 202, 0.15);
+    border-color: #5a9aca;
+  }
+
+  .tl-block.sel::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: #5a9aca;
+  }
+
+  .tl-block.secondary.sel {
+    background: rgba(61, 220, 151, 0.13);
+    border-color: #3ddc97;
+  }
+
+  .tl-block.secondary.sel::before {
+    background: #3ddc97;
+  }
+
+  /* On hover the block grows to show its full text (and overlays neighbours below). Placed
+     after the .sel rules so the opaque background wins; selection stays shown via the border
+     and the left accent bar. */
+  .tl-block:hover {
+    height: auto;
+    min-height: var(--tl-h);
+    overflow: visible;
+    z-index: 5;
+    background: #20262f;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  }
+
+  .tl-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
   }
 
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
+  .tl-block.secondary .tl-text {
+    color: #c5cedd;
   }
 
-  .thumb-action {
-    position: relative;
-    display: flex;
-    align-items: center;
+  .tl-actions {
+    display: none;
+    flex: none;
+    gap: 2px;
   }
 
-  .range-audio-btn {
-    margin-left: auto;
-    margin-right: 8px;
+  .tl-block:hover .tl-actions,
+  .tl-block.sel .tl-actions {
+    display: flex;
+  }
+
+  .icon-btn.compact {
+    width: 26px;
+    height: 26px;
+    padding: 4px;
+    border-radius: 6px;
+  }
+
+  .icon-btn.compact svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .selection-sub {
+    color: #76849a;
+    font-weight: 400;
+    font-size: 0.9em;
+  }
+
+  .thumb-preview-float {
+    position: fixed;
+    z-index: 40;
+    background: #0f1318;
+    border: 1px solid #1f252e;
+    border-radius: 8px;
+    padding: 8px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+  }
+
+  .thumb-preview-float img {
+    display: block;
+    max-width: 420px;
+    max-height: 240px;
+    border-radius: 4px;
   }
 
   .icon-btn:disabled {
@@ -1745,27 +2438,6 @@
   .icon-btn svg {
     width: 22px;
     height: 22px;
-  }
-
-  .thumb-preview {
-    position: absolute;
-    top: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 10;
-    background: #0f1318;
-    border: 1px solid #1f252e;
-    border-radius: 8px;
-    padding: 8px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
-    pointer-events: none;
-  }
-
-  .thumb-preview img {
-    max-width: 420px;
-    max-height: 240px;
-    display: block;
-    border-radius: 4px;
   }
 
   .selection-bar {

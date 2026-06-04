@@ -20,6 +20,7 @@ export interface AnkiSettings {
   noteType: string
   frontField: string
   sentenceField: string
+  secondaryField: string
   audioField: string
   imageField: string
   maxCardAgeMinutes: number
@@ -32,10 +33,16 @@ export interface ConnectionSettings {
 
 export interface DisplaySettings {
   subtitleFontSize: number
+  secondaryFontSize: number
   mediaFilenameRegex: string
   mediaFilenameRegexEnabled: boolean
   sentenceCleanRegex: string
   sentenceCleanRegexEnabled: boolean
+  secondaryCleanRegex: string
+  secondaryCleanRegexEnabled: boolean
+  showSecondaryColumn: boolean
+  timelineZoom: number
+  primaryColumnFraction: number
 }
 
 export interface Settings {
