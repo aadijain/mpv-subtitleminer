@@ -345,6 +345,17 @@
   const filterCollapsed = ref(false)
   const anyFilterHidden = computed(() => filterColumns.value.some((c) => c.hasHidden))
 
+  // Hovering a chip previews which lines it controls: blocks in the same track that match the
+  // hovered value light up ('hl'), the rest of that track recedes ('dim'). The other track is
+  // left neutral. Returns the class to add to a block (or '' when nothing is hovered).
+  const hoveredFilter = ref<{ track: SubtitleTrack; axis: FilterAxis; value: string } | null>(null)
+  const blockHoverClass = (m: SubtitleMessage): '' | 'hl' | 'dim' => {
+    const hf = hoveredFilter.value
+    if (!hf || m.track !== hf.track) return ''
+    const value = hf.axis === 'style' ? m.style : m.name
+    return value === hf.value ? 'hl' : 'dim'
+  }
+
   // Split the single message stream into two time-ordered columns by track, dropping any
   // line hidden by the style/name filter so everything downstream readjusts.
   const sortByTime = (a: SubtitleMessage, b: SubtitleMessage) =>
@@ -1475,6 +1486,10 @@
                   type="button"
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'style', tag.value)"
+                  @mouseenter="
+                    hoveredFilter = { track: col.track, axis: 'style', value: tag.value }
+                  "
+                  @mouseleave="hoveredFilter = null"
                 >
                   <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
                   <span class="tl-chip-count">{{ tag.count }}</span>
@@ -1490,6 +1505,8 @@
                   type="button"
                   :title="`${tag.hidden ? 'Show' : 'Hide'} ${tagLabel(tag.value)} (${tag.count})`"
                   @click="toggleFilter(col.track, 'name', tag.value)"
+                  @mouseenter="hoveredFilter = { track: col.track, axis: 'name', value: tag.value }"
+                  @mouseleave="hoveredFilter = null"
                 >
                   <span class="tl-chip-text">{{ tagLabel(tag.value) }}</span>
                   <span class="tl-chip-count">{{ tag.count }}</span>
@@ -1534,7 +1551,10 @@
               v-for="message in primaryMessages"
               :key="message.uid"
               class="tl-block"
-              :class="{ sel: isSelected(message.uid), cal: !!slotOf(message) }"
+              :class="[
+                { sel: isSelected(message.uid), cal: !!slotOf(message) },
+                blockHoverClass(message),
+              ]"
               :style="blockStyle(message)"
               @click="togglePrimary(message)"
             >
@@ -1620,7 +1640,10 @@
               v-for="message in secondaryMessages"
               :key="message.uid"
               class="tl-block secondary"
-              :class="{ sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) }"
+              :class="[
+                { sel: isSelectedSecondary(message.uid), cal: !!slotOf(message) },
+                blockHoverClass(message),
+              ]"
               :style="blockStyle(message)"
               @click="toggleSecondary(message)"
             >
@@ -2712,6 +2735,8 @@
     transition:
       background 0.15s ease,
       border-color 0.15s ease,
+      box-shadow 0.12s ease,
+      opacity 0.12s ease,
       left 0.12s ease,
       width 0.12s ease;
   }
@@ -2749,6 +2774,19 @@
 
   .tl-block.secondary.sel::before {
     background: #3ddc97;
+  }
+
+  /* Chip-hover preview: matching blocks light up, the rest of that track recedes. Placed
+     after .sel so the highlight ring wins over the selection ring while previewing. */
+  .tl-block.hl {
+    border-color: #aeb9c9;
+    box-shadow:
+      0 0 0 2px rgba(174, 185, 201, 0.45),
+      0 4px 16px rgba(0, 0, 0, 0.5);
+    z-index: 4;
+  }
+  .tl-block.dim {
+    opacity: 0.3;
   }
 
   /* On hover the block grows to show its full text (and overlays neighbours below). Placed
