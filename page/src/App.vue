@@ -37,6 +37,7 @@
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
+      tags: ['mpv-subtitleminer'],
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
@@ -178,6 +179,11 @@
     }
   }
 
+  // Split a free-text tag input into Anki's space/comma-separated tag list.
+  function parseTags(value: string): string[] {
+    return value.split(/[\s,]+/).filter(Boolean)
+  }
+
   function onModelChange(value: string) {
     localSettings.value = {
       ...localSettings.value,
@@ -191,7 +197,7 @@
     }
   }
 
-  function onFieldChange(field: keyof AnkiSettings, value: string | number) {
+  function onFieldChange(field: keyof AnkiSettings, value: string | number | string[]) {
     // @ts-ignore - dynamic assignment
     localSettings.value = { ...localSettings.value, [field]: value }
   }
@@ -1247,6 +1253,10 @@
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
+        const tags = settings.value.anki.tags
+        if (tags.length > 0) {
+          await anki.addTags([targetNote.noteId], tags.join(' '))
+        }
         ankiSuccess.value[anchorKey] = true
         const noteId = targetNote.noteId
         const count = primaryMsgs.length + secondaryMsgs.length
@@ -1922,6 +1932,23 @@
                         {{ field }}
                       </option>
                     </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Tags</span>
+                    <input
+                      type="text"
+                      :value="localSettings.tags.join(' ')"
+                      placeholder="mpv-subtitleminer"
+                      @input="
+                        (e) =>
+                          onFieldChange('tags', parseTags((e.target as HTMLInputElement).value))
+                      "
+                    />
+                    <small class="field-hint"
+                      >Space- or comma-separated tags added to every card created or updated (leave
+                      blank for none).</small
+                    >
                   </label>
 
                   <label class="form-group">
