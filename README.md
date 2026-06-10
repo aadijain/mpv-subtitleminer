@@ -12,6 +12,8 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 
 - Stream subtitles to web front end and interactively look up words.
 - Anki integration via AnkiConnect: Select your note type, make a card and add media.
+- Two card workflows: add the selected subtitles to your most recent Yomitan word card, or create a standalone sentence card directly (no Yomitan card needed) into its own deck and note type.
+- Per-card-type tags: configurable tag list applied independently to word cards and sentence cards (defaults to `mpv-subtitleminer`).
 - Replay sentences with audio anytime.
 - Custom regex to clean subtitle text (e.g. strip parentheticals) before display and Anki export.
 - Page title reflects the currently playing media file name.
