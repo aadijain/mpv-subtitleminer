@@ -42,6 +42,15 @@
         maxCardAgeMinutes: 5,
         tags: ['mpv-subtitleminer'],
       },
+      sentence: {
+        deck: '',
+        noteType: '',
+        primaryField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
+        tags: ['mpv-subtitleminer'],
+      },
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
@@ -96,6 +105,7 @@
           ...parsed,
           anki: {
             word: { ...defaultSettings.anki.word, ...(parsed.anki?.word ?? legacyWord ?? {}) },
+            sentence: { ...defaultSettings.anki.sentence, ...(parsed.anki?.sentence ?? {}) },
           },
           connection: { ...defaultSettings.connection, ...parsed.connection },
           display: { ...defaultSettings.display, ...(parsed.display ?? {}) },
@@ -126,6 +136,7 @@
   function cloneAnki(a: AnkiSettings): AnkiSettings {
     return {
       word: { ...a.word, tags: [...a.word.tags] },
+      sentence: { ...a.sentence, tags: [...a.sentence.tags] },
     }
   }
 
@@ -141,6 +152,7 @@
   const ankiVersion = ref<number | null>(null)
   const connectionError = ref<string | null>(null)
   const modelsWithFields = ref<Record<string, string[]>>({})
+  const deckNamesList = ref<string[]>([])
   const loadingModels = ref(false)
   const modelsError = ref<string | null>(null)
   const localSettings = ref<AnkiSettings>(cloneAnki(settings.value.anki))
@@ -151,12 +163,11 @@
   // Raw tag-field text, kept as typed (like localPortInput) so re-rendering the
   // parsed tag list never rewrites the input and jumps the cursor.
   const wordTagsInput = ref('')
+  const sentenceTagsInput = ref('')
 
   const modelNames = computed(() => Object.keys(modelsWithFields.value).sort())
-  const availableFields = computed(() => {
-    const model = localSettings.value.word.noteType
-    return model ? (modelsWithFields.value[model] ?? []) : []
-  })
+  const fieldsFor = (noteType: string): string[] =>
+    noteType ? (modelsWithFields.value[noteType] ?? []) : []
   const settingsValid = computed(() => {
     const { noteType, sentenceField, secondaryField, audioField, imageField } =
       localSettings.value.word
@@ -173,6 +184,7 @@
       localDisplay.value = { ...settings.value.display }
       localPortInput.value = localConnection.value.ports.join(', ')
       wordTagsInput.value = localSettings.value.word.tags.join(' ')
+      sentenceTagsInput.value = localSettings.value.sentence.tags.join(' ')
       if (connectionStatus.value === 'untested') {
         void testConnection()
       }
@@ -200,7 +212,9 @@
     modelsError.value = null
 
     try {
-      modelsWithFields.value = await anki.getModelsWithFields()
+      const [models, decks] = await Promise.all([anki.getModelsWithFields(), anki.deckNames()])
+      modelsWithFields.value = models
+      deckNamesList.value = [...decks].sort()
     } catch (err) {
       modelsError.value = err instanceof Error ? err.message : 'Failed to load models'
     } finally {
@@ -213,20 +227,16 @@
     return value.split(/\s+/).filter(Boolean)
   }
 
-  function updateWordTags(raw: string) {
-    wordTagsInput.value = raw
-    onWordChange('tags', parseTags(raw))
-  }
+  // Anki-field pickers per card section, rendered via FieldSelect. The rows
+  // also drive the field reset on note-type change so the two can't drift.
+  // Word rows update an existing note ("Don't update"); sentence rows fill a
+  // brand-new note ("Don't set").
+  type CardSection = 'word' | 'sentence'
+  type FieldRow<K> = { key: K; label: string; emptyLabel: string; hint?: string }
 
-  // Anki-field pickers for the word card settings, rendered via FieldSelect.
-  // Also drives the field reset on note-type change so the two can't drift.
-  type WordFieldKey =
-    | 'frontField'
-    | 'sentenceField'
-    | 'secondaryField'
-    | 'audioField'
-    | 'imageField'
-  const wordFieldRows: { key: WordFieldKey; label: string; emptyLabel: string; hint?: string }[] = [
+  const wordFieldRows: FieldRow<
+    'frontField' | 'sentenceField' | 'secondaryField' | 'audioField' | 'imageField'
+  >[] = [
     {
       key: 'frontField',
       label: 'Front field',
@@ -249,18 +259,56 @@
     { key: 'imageField', label: 'Image field', emptyLabel: "Don't update" },
   ]
 
-  function onModelChange(value: string) {
-    const word = { ...localSettings.value.word, noteType: value }
-    for (const row of wordFieldRows) {
-      word[row.key] = ''
-    }
-    localSettings.value = { ...localSettings.value, word }
-  }
+  const sentenceFieldRows: FieldRow<
+    'primaryField' | 'secondaryField' | 'audioField' | 'imageField'
+  >[] = [
+    {
+      key: 'primaryField',
+      label: 'Primary sentence field',
+      emptyLabel: 'Select…',
+      hint: 'Filled from the primary column selection',
+    },
+    {
+      key: 'secondaryField',
+      label: 'Secondary sentence field',
+      emptyLabel: "Don't set",
+      hint: 'Filled from the secondary column selection',
+    },
+    { key: 'audioField', label: 'Audio field', emptyLabel: "Don't set" },
+    { key: 'imageField', label: 'Image field', emptyLabel: "Don't set" },
+  ]
 
-  function onWordChange<K extends keyof WordCardSettings>(field: K, value: WordCardSettings[K]) {
+  function onCardChange<S extends CardSection, K extends keyof AnkiSettings[S]>(
+    section: S,
+    field: K,
+    value: AnkiSettings[S][K],
+  ) {
     localSettings.value = {
       ...localSettings.value,
-      word: { ...localSettings.value.word, [field]: value },
+      [section]: { ...localSettings.value[section], [field]: value },
+    }
+  }
+
+  const cardTagsInput: Record<CardSection, Ref<string>> = {
+    word: wordTagsInput,
+    sentence: sentenceTagsInput,
+  }
+
+  function updateCardTags(section: CardSection, raw: string) {
+    cardTagsInput[section].value = raw
+    onCardChange(section, 'tags', parseTags(raw))
+  }
+
+  function onCardModelChange(section: CardSection, value: string) {
+    onCardChange(section, 'noteType', value)
+    if (section === 'word') {
+      for (const row of wordFieldRows) {
+        onCardChange('word', row.key, '')
+      }
+    } else {
+      for (const row of sentenceFieldRows) {
+        onCardChange('sentence', row.key, '')
+      }
     }
   }
 
@@ -1927,14 +1975,14 @@
 
             <section class="section">
               <div class="section-header">
-                <h3>Card configuration</h3>
+                <h3>Word mining</h3>
                 <span v-if="connectionStatus !== 'connected'" class="subtle"
                   >Connect first to load models</span
                 >
               </div>
 
               <div v-if="connectionStatus !== 'connected'" class="muted-box">
-                Connect to Anki to configure card settings.
+                Connect to Anki to configure word cards.
               </div>
               <div v-else class="form-grid">
                 <p class="hint" style="grid-column: 1 / -1">
@@ -1945,7 +1993,9 @@
                   <span>Note type</span>
                   <select
                     :value="localSettings.word.noteType"
-                    @change="(e) => onModelChange((e.target as HTMLSelectElement).value)"
+                    @change="
+                      (e) => onCardModelChange('word', (e.target as HTMLSelectElement).value)
+                    "
                   >
                     <option value="">Select a note type…</option>
                     <option v-for="model in modelNames" :key="model" :value="model">
@@ -1960,10 +2010,10 @@
                     :key="row.key"
                     :label="row.label"
                     :model-value="localSettings.word[row.key]"
-                    :options="availableFields"
+                    :options="fieldsFor(localSettings.word.noteType)"
                     :empty-label="row.emptyLabel"
                     :hint="row.hint"
-                    @update:model-value="(v: string) => onWordChange(row.key, v)"
+                    @update:model-value="(v: string) => onCardChange('word', row.key, v)"
                   />
 
                   <label class="form-group">
@@ -1975,7 +2025,8 @@
                       :value="localSettings.word.maxCardAgeMinutes"
                       @input="
                         (e) =>
-                          onWordChange(
+                          onCardChange(
+                            'word',
                             'maxCardAgeMinutes',
                             parseFloat((e.target as HTMLInputElement).value) || 0,
                           )
@@ -1992,7 +2043,7 @@
                       type="text"
                       :value="wordTagsInput"
                       placeholder="mpv-subtitleminer"
-                      @input="(e) => updateWordTags((e.target as HTMLInputElement).value)"
+                      @input="(e) => updateCardTags('word', (e.target as HTMLInputElement).value)"
                     />
                     <small class="field-hint"
                       >Space-separated tags added to word cards (leave blank for none).</small
@@ -2000,6 +2051,87 @@
                   </label>
                 </template>
                 <div v-if="loadingModels" class="muted-box">Loading note types…</div>
+                <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Sentence mining</h3>
+                <span v-if="connectionStatus !== 'connected'" class="subtle"
+                  >Connect first to load decks</span
+                >
+              </div>
+
+              <div v-if="connectionStatus !== 'connected'" class="muted-box">
+                Connect to Anki to configure sentence cards.
+              </div>
+              <div v-else class="form-grid">
+                <p class="hint" style="grid-column: 1 / -1">
+                  Creates a brand-new card from the selected subtitles (no Yomitan card needed).
+                </p>
+
+                <div class="form-row-2">
+                  <label class="form-group">
+                    <span>Deck</span>
+                    <select
+                      :value="localSettings.sentence.deck"
+                      @change="
+                        (e) =>
+                          onCardChange('sentence', 'deck', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select a deck…</option>
+                      <option v-for="deck in deckNamesList" :key="deck" :value="deck">
+                        {{ deck }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Note type</span>
+                    <select
+                      :value="localSettings.sentence.noteType"
+                      @change="
+                        (e) => onCardModelChange('sentence', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select a note type…</option>
+                      <option v-for="model in modelNames" :key="model" :value="model">
+                        {{ model }}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+
+                <template v-if="localSettings.sentence.noteType">
+                  <FieldSelect
+                    v-for="row in sentenceFieldRows"
+                    :key="row.key"
+                    :label="row.label"
+                    :model-value="localSettings.sentence[row.key]"
+                    :options="fieldsFor(localSettings.sentence.noteType)"
+                    :empty-label="row.emptyLabel"
+                    :hint="row.hint"
+                    @update:model-value="(v: string) => onCardChange('sentence', row.key, v)"
+                  />
+
+                  <label class="form-group">
+                    <span>Tags</span>
+                    <input
+                      type="text"
+                      :value="sentenceTagsInput"
+                      placeholder="mpv-subtitleminer"
+                      @input="
+                        (e) => updateCardTags('sentence', (e.target as HTMLInputElement).value)
+                      "
+                    />
+                    <small class="field-hint"
+                      >Space-separated tags added to sentence cards (leave blank for none).</small
+                    >
+                  </label>
+                </template>
+                <div v-if="loadingModels" class="muted-box">Loading decks and note types…</div>
                 <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
               </div>
             </section>
@@ -3222,6 +3354,15 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 10px;
+  }
+
+  /* Full-width row inside .form-grid for two fields that belong together. */
+  .form-row-2 {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    min-width: 0;
   }
 
   .form-group {
