@@ -136,6 +136,11 @@
     return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
   })
 
+  const sentenceConfigured = computed(() => {
+    const { deck, noteType, primaryField } = settings.value.anki.sentence
+    return !!deck && !!noteType && !!primaryField
+  })
+
   const showSettings = ref(false)
   type ConnectionStatus = 'untested' | 'testing' | 'connected' | 'error'
   const connectionStatus = ref<ConnectionStatus>('untested')
@@ -1368,6 +1373,67 @@
     }
   }
 
+  // Create a brand-new sentence card via addNote (no existing Yomitan card).
+  const createSentenceCard = async () => {
+    const primaryMsgs = getSelectedMessages()
+    const secondaryMsgs = getSelectedSecondaryMessages()
+    if (!sentenceConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0))
+      return
+
+    const { deck, noteType, primaryField, secondaryField, audioField, imageField, tags } =
+      settings.value.anki.sentence
+    const range = getSelectionRange() // primary first/last (audio/image come from primary)
+    const first = range?.first
+    const last = range?.last
+
+    const anchor = primaryMsgs[0] ?? secondaryMsgs[0]
+    if (!anchor) return
+    const anchorKey = anchor.uid
+    const mediaId = first?.id ?? anchor.id
+    sendingToAnki.value[anchorKey] = true
+    ankiError.value[anchorKey] = ''
+
+    try {
+      const fields: Record<string, string> = {}
+
+      if (primaryField && primaryMsgs.length > 0) {
+        fields[primaryField] = primaryMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
+      }
+
+      if (secondaryField && secondaryMsgs.length > 0) {
+        fields[secondaryField] = secondaryMsgs.map((m) => cleanSecondary(m.subtitle)).join(' ')
+      }
+
+      Object.assign(
+        fields,
+        await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+      )
+
+      const noteId = await anki.addNote(deck, noteType, fields, tags)
+      ankiSuccess.value[anchorKey] = true
+      const count = primaryMsgs.length + secondaryMsgs.length
+      toast.success(`Created sentence card from ${count} subtitle(s)`, {
+        duration: 5000,
+        action: {
+          label: 'Browse',
+          onClick: () => {
+            void anki.guiBrowse(`nid:${noteId}`)
+          },
+        },
+      })
+
+      setTimeout(() => {
+        delete ankiSuccess.value[anchorKey]
+        clearSelection()
+      }, 2000)
+    } catch (err) {
+      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
+      toast.error(err instanceof Error ? err.message : 'Failed to create sentence card')
+    } finally {
+      delete sendingToAnki.value[anchorKey]
+    }
+  }
+
   const requestMediaFromServer = (
     msg: SubtitleMessage,
     type: 'audio' | 'thumbnail',
@@ -1831,6 +1897,14 @@
           @click="sendSelectionToAnki"
         >
           Add to word card: {{ targetCardPreview }}
+        </button>
+        <button
+          v-if="sentenceConfigured"
+          class="selection-btn create-btn"
+          :disabled="selectedMessages.size === 0 && selectedSecondary.size === 0"
+          @click="createSentenceCard"
+        >
+          Create sentence card
         </button>
         <button
           class="selection-btn clear-btn"
@@ -3287,6 +3361,7 @@
     border-radius: 6px;
     cursor: pointer;
     font-size: 0.95em;
+    line-height: 1.2;
     color: #e9edf2;
   }
 
@@ -3301,6 +3376,14 @@
 
   .selection-btn.send-btn:hover {
     background: #38764c;
+  }
+
+  .selection-btn.create-btn {
+    background: #2d456a;
+  }
+
+  .selection-btn.create-btn:hover {
+    background: #365689;
   }
 
   .selection-btn.clear-btn {
