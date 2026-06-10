@@ -12,6 +12,7 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 
 - Stream subtitles to web front end and interactively look up words.
 - Anki integration via AnkiConnect: Select your note type, make a card and add media.
+- Two mining workflows: add to the card you just made, or create a new sentence card from scratch (see [Mining workflows](#mining-workflows)).
 - Replay sentences with audio anytime.
 - Custom regex to clean subtitle text (e.g. strip parentheticals) before display and Anki export.
 - Page title reflects the currently playing media file name.
@@ -19,6 +20,15 @@ https://github.com/user-attachments/assets/47437d89-54f1-4039-bd17-d1fb8b453725
 - Timeline view: primary and secondary subs are displayed as parallel columns in a vertical timeline, each independently selectable.
 - Overlapping / Simultaneous subtitle handling (Ex: signs, SFX, TL notes) displayed side-by-side in the timeline
 - Style/Name filter: hide or show subtitle lines by their ASS Style or Name, per track, as a live display filter.
+
+## Mining workflows
+
+The subtitles you select can be mined to Anki in two ways:
+
+| Word mining                                                                                                                                                                         | Sentence mining                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Adds the sentence, audio and screenshot to a card you just made, e.g. after a Yomitan lookup.                                                                                       | Creates a whole new card with the sentence, audio and screenshot, no existing card needed.                                                       |
+| 1. In Settings > Word mining, choose your note type and map its fields.<br>2. Look a word up in Yomitan to make the card.<br>3. Select subtitles.<br>4. Press **Add to word card**. | 1. In Settings > Sentence mining, choose a deck and note type, and map its fields.<br>2. Select subtitles.<br>3. Press **Create sentence card**. |
 
 ## Downloads
 
