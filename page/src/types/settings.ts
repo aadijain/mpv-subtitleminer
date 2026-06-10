@@ -27,8 +27,19 @@ export interface WordCardSettings {
   tags: string[]
 }
 
+export interface SentenceCardSettings {
+  deck: string
+  noteType: string
+  primaryField: string
+  secondaryField: string
+  audioField: string
+  imageField: string
+  tags: string[]
+}
+
 export interface AnkiSettings {
   word: WordCardSettings
+  sentence: SentenceCardSettings
 }
 
 export interface ConnectionSettings {

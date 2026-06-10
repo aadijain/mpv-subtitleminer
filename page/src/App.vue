@@ -19,6 +19,7 @@
     ConnectionSettings,
     DisplaySettings,
     MediaSettings,
+    SentenceCardSettings,
     Settings,
     WordCardSettings,
   } from './types/settings'
@@ -39,6 +40,15 @@
         audioField: '',
         imageField: '',
         maxCardAgeMinutes: 5,
+        tags: ['mpv-subtitleminer'],
+      },
+      sentence: {
+        deck: '',
+        noteType: '',
+        primaryField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
         tags: ['mpv-subtitleminer'],
       },
     },
@@ -85,6 +95,7 @@
           ...parsed,
           anki: {
             word: { ...defaultSettings.anki.word, ...(parsed.anki?.word ?? {}) },
+            sentence: { ...defaultSettings.anki.sentence, ...(parsed.anki?.sentence ?? {}) },
           },
           connection: { ...defaultSettings.connection, ...parsed.connection },
           display: { ...defaultSettings.display, ...(parsed.display ?? {}) },
@@ -115,6 +126,7 @@
   function cloneAnki(a: AnkiSettings): AnkiSettings {
     return {
       word: { ...a.word, tags: [...a.word.tags] },
+      sentence: { ...a.sentence, tags: [...a.sentence.tags] },
     }
   }
 
@@ -130,6 +142,7 @@
   const ankiVersion = ref<number | null>(null)
   const connectionError = ref<string | null>(null)
   const modelsWithFields = ref<Record<string, string[]>>({})
+  const deckNamesList = ref<string[]>([])
   const loadingModels = ref(false)
   const modelsError = ref<string | null>(null)
   const localSettings = ref<AnkiSettings>(cloneAnki(settings.value.anki))
@@ -149,6 +162,11 @@
     // Allow saving if Anki is not configured
     if (!noteType) return true
     return !!sentenceField || !!secondaryField || !!audioField || !!imageField
+  })
+
+  const sentenceAvailableFields = computed(() => {
+    const model = localSettings.value.sentence.noteType
+    return model ? (modelsWithFields.value[model] ?? []) : []
   })
 
   watch(showSettings, (isOpen) => {
@@ -185,7 +203,9 @@
     modelsError.value = null
 
     try {
-      modelsWithFields.value = await anki.getModelsWithFields()
+      const [models, decks] = await Promise.all([anki.getModelsWithFields(), anki.deckNames()])
+      modelsWithFields.value = models
+      deckNamesList.value = [...decks].sort()
     } catch (err) {
       modelsError.value = err instanceof Error ? err.message : 'Failed to load models'
     } finally {
@@ -218,6 +238,30 @@
     localSettings.value = {
       ...localSettings.value,
       word: { ...localSettings.value.word, [field]: value },
+    }
+  }
+
+  function onSentenceChange<K extends keyof SentenceCardSettings>(
+    field: K,
+    value: SentenceCardSettings[K],
+  ) {
+    localSettings.value = {
+      ...localSettings.value,
+      sentence: { ...localSettings.value.sentence, [field]: value },
+    }
+  }
+
+  function onSentenceModelChange(value: string) {
+    localSettings.value = {
+      ...localSettings.value,
+      sentence: {
+        ...localSettings.value.sentence,
+        noteType: value,
+        primaryField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
+      },
     }
   }
 
@@ -1994,6 +2038,146 @@
                 </template>
                 <div v-if="loadingModels" class="muted-box">Loading note types…</div>
                 <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Sentence mining</h3>
+                <span v-if="connectionStatus !== 'connected'" class="subtle"
+                  >Connect first to load decks</span
+                >
+              </div>
+
+              <div v-if="connectionStatus !== 'connected'" class="muted-box">
+                Connect to Anki to configure sentence cards.
+              </div>
+              <div v-else class="form-grid">
+                <p class="hint" style="grid-column: 1 / -1">
+                  Creates a brand-new card from the selected subtitles (no Yomitan card needed).
+                </p>
+
+                <div
+                  style="
+                    grid-column: 1 / -1;
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px;
+                  "
+                >
+                  <label class="form-group">
+                    <span>Deck</span>
+                    <select
+                      :value="localSettings.sentence.deck"
+                      @change="
+                        (e) => onSentenceChange('deck', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select a deck…</option>
+                      <option v-for="deck in deckNamesList" :key="deck" :value="deck">
+                        {{ deck }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Note type</span>
+                    <select
+                      :value="localSettings.sentence.noteType"
+                      @change="(e) => onSentenceModelChange((e.target as HTMLSelectElement).value)"
+                    >
+                      <option value="">Select a note type…</option>
+                      <option v-for="model in modelNames" :key="model" :value="model">
+                        {{ model }}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+
+                <template v-if="localSettings.sentence.noteType">
+                  <label class="form-group">
+                    <span>Primary sentence field</span>
+                    <select
+                      :value="localSettings.sentence.primaryField"
+                      @change="
+                        (e) =>
+                          onSentenceChange('primaryField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select…</option>
+                      <option v-for="field in sentenceAvailableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                    <small class="field-hint"
+                      >Required: filled from the primary column selection</small
+                    >
+                  </label>
+
+                  <label class="form-group">
+                    <span>Secondary sentence field</span>
+                    <select
+                      :value="localSettings.sentence.secondaryField"
+                      @change="
+                        (e) =>
+                          onSentenceChange('secondaryField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't set</option>
+                      <option v-for="field in sentenceAvailableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                    <small class="field-hint">Filled from the secondary column selection</small>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Audio field</span>
+                    <select
+                      :value="localSettings.sentence.audioField"
+                      @change="
+                        (e) => onSentenceChange('audioField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't set</option>
+                      <option v-for="field in sentenceAvailableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Image field</span>
+                    <select
+                      :value="localSettings.sentence.imageField"
+                      @change="
+                        (e) => onSentenceChange('imageField', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Don't set</option>
+                      <option v-for="field in sentenceAvailableFields" :key="field" :value="field">
+                        {{ field }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Tags</span>
+                    <input
+                      type="text"
+                      :value="localSettings.sentence.tags.join(' ')"
+                      placeholder="mpv-subtitleminer"
+                      @input="
+                        (e) =>
+                          onSentenceChange('tags', parseTags((e.target as HTMLInputElement).value))
+                      "
+                    />
+                    <small class="field-hint"
+                      >Space- or comma-separated tags added to sentence cards (leave blank for
+                      none).</small
+                    >
+                  </label>
+                </template>
               </div>
             </section>
 
