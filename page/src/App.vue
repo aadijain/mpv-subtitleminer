@@ -1228,6 +1228,60 @@
     return `mpv_subtitleminer_${msgId}_${timestamp}.${ext.toLowerCase()}`
   }
 
+  // Fetch/store the audio clip and thumbnail for the selection and return the
+  // resulting field -> value map (e.g. `[sound:...]`, `<img>`). Shared by the
+  // word and sentence card flows; each passes its own audio/image field names.
+  async function buildMediaFields(
+    primaryMsgs: SubtitleMessage[],
+    first: SubtitleMessage | undefined,
+    last: SubtitleMessage | undefined,
+    mediaId: number,
+    audioField: string,
+    imageField: string,
+  ): Promise<Record<string, string>> {
+    const fields: Record<string, string> = {}
+    if (!first || !last) return fields
+
+    if (audioField) {
+      if (primaryMsgs.length > 1) {
+        const selectionPort = first.sourcePort
+        const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
+        if (!allSamePort) {
+          throw new Error('Selected subtitles must come from the same connection for audio.')
+        }
+      }
+      const audioData =
+        primaryMsgs.length > 1
+          ? await requestAudioRange(first.id, last.id, first.sourcePort)
+          : first.audio || (await requestMediaFromServer(first, 'audio'))
+
+      if (audioData) {
+        const filename = generateMediaFilename(mediaId, 'audio')
+        await anki.storeMediaFile(filename, audioData)
+        fields[audioField] = `[sound:${filename}]`
+      }
+    }
+
+    if (imageField) {
+      let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
+
+      if (!imageData) {
+        imageData = await requestMediaFromServer(
+          first,
+          'thumbnail',
+          primaryMsgs.length > 1 ? last.id : undefined,
+        )
+      }
+      if (imageData) {
+        const filename = generateMediaFilename(mediaId, 'image')
+        await anki.storeMediaFile(filename, imageData)
+        fields[imageField] = `<img src="${filename}">`
+      }
+    }
+
+    return fields
+  }
+
   const sendSelectionToAnki = async () => {
     const primaryMsgs = getSelectedMessages()
     const secondaryMsgs = getSelectedSecondaryMessages()
@@ -1277,42 +1331,10 @@
         fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
       }
 
-      if (audioField && first && last) {
-        if (primaryMsgs.length > 1) {
-          const selectionPort = first.sourcePort
-          const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
-          if (!allSamePort) {
-            throw new Error('Selected subtitles must come from the same connection for audio.')
-          }
-        }
-        const audioData =
-          primaryMsgs.length > 1
-            ? await requestAudioRange(first.id, last.id, first.sourcePort)
-            : first.audio || (await requestMediaFromServer(first, 'audio'))
-
-        if (audioData) {
-          const filename = generateMediaFilename(mediaId, 'audio')
-          await anki.storeMediaFile(filename, audioData)
-          fieldUpdates[audioField] = `[sound:${filename}]`
-        }
-      }
-
-      if (imageField && first && last) {
-        let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
-
-        if (!imageData) {
-          imageData = await requestMediaFromServer(
-            first,
-            'thumbnail',
-            primaryMsgs.length > 1 ? last.id : undefined,
-          )
-        }
-        if (imageData) {
-          const filename = generateMediaFilename(mediaId, 'image')
-          await anki.storeMediaFile(filename, imageData)
-          fieldUpdates[imageField] = `<img src="${filename}">`
-        }
-      }
+      Object.assign(
+        fieldUpdates,
+        await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+      )
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
