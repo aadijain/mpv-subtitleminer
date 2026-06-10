@@ -168,6 +168,15 @@ export async function updateNoteFields(
 }
 
 /**
+ * Add one or more tags to existing notes
+ * @param noteIds Note IDs to tag
+ * @param tags Space-separated tag string
+ */
+export async function addTags(noteIds: number[], tags: string): Promise<null> {
+  return invoke<null>('addTags', { notes: noteIds, tags })
+}
+
+/**
  * Get the most recently added notes
  * @param count Number of recent notes to fetch
  * @param modelName Optional filter by note type

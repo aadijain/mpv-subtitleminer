@@ -24,6 +24,7 @@ export interface AnkiSettings {
   audioField: string
   imageField: string
   maxCardAgeMinutes: number
+  tags: string[]
 }
 
 export interface ConnectionSettings {

@@ -37,6 +37,7 @@
       audioField: '',
       imageField: '',
       maxCardAgeMinutes: 5,
+      tags: ['mpv-subtitleminer'],
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
@@ -123,6 +124,9 @@
   const localMedia = ref<MediaSettings>({ ...settings.value.media })
   const localDisplay = ref<DisplaySettings>({ ...settings.value.display })
   const localPortInput = ref('')
+  // Raw tag-field text, kept as typed (like localPortInput) so re-rendering the
+  // parsed tag list never rewrites the input and jumps the cursor.
+  const wordTagsInput = ref('')
 
   const modelNames = computed(() => Object.keys(modelsWithFields.value).sort())
   const availableFields = computed(() => {
@@ -143,6 +147,7 @@
       localMedia.value = { ...settings.value.media }
       localDisplay.value = { ...settings.value.display }
       localPortInput.value = localConnection.value.ports.join(', ')
+      wordTagsInput.value = localSettings.value.tags.join(' ')
       if (connectionStatus.value === 'untested') {
         void testConnection()
       }
@@ -178,6 +183,16 @@
     }
   }
 
+  // Split a free-text tag input into Anki's space-separated tag list.
+  function parseTags(value: string): string[] {
+    return value.split(/\s+/).filter(Boolean)
+  }
+
+  function updateWordTags(raw: string) {
+    wordTagsInput.value = raw
+    onFieldChange('tags', parseTags(raw))
+  }
+
   function onModelChange(value: string) {
     localSettings.value = {
       ...localSettings.value,
@@ -190,7 +205,7 @@
     }
   }
 
-  function onFieldChange(field: keyof AnkiSettings, value: string | number) {
+  function onFieldChange(field: keyof AnkiSettings, value: string | number | string[]) {
     // @ts-ignore - dynamic assignment
     localSettings.value = { ...localSettings.value, [field]: value }
   }
@@ -1252,6 +1267,18 @@
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
+        const tags = settings.value.anki.tags
+        if (tags.length > 0) {
+          // The fields are already committed at this point, so a tagging
+          // failure must not be reported as a failed send (which would invite
+          // a duplicate re-send); warn and continue to the success path.
+          try {
+            await anki.addTags([targetNote.noteId], tags.join(' '))
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : 'unknown error'
+            toast.warning(`Card updated, but adding tags failed: ${reason}`)
+          }
+        }
         ankiSuccess.value[anchorKey] = true
         const noteId = targetNote.noteId
         const count = primaryMsgs.length + secondaryMsgs.length
@@ -1946,6 +1973,20 @@
                     />
                     <small class="field-hint"
                       >Prevent adding to cards older than this (0 for no limit).</small
+                    >
+                  </label>
+
+                  <label class="form-group">
+                    <span>Tags</span>
+                    <input
+                      type="text"
+                      :value="wordTagsInput"
+                      placeholder="mpv-subtitleminer"
+                      @input="(e) => updateWordTags((e.target as HTMLInputElement).value)"
+                    />
+                    <small class="field-hint"
+                      >Space-separated tags added to every card created or updated (leave blank for
+                      none).</small
                     >
                   </label>
                 </template>
