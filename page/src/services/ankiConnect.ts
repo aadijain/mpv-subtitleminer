@@ -132,6 +132,29 @@ export async function getModelsWithFields(): Promise<Record<string, string[]>> {
 }
 
 /**
+ * Get the list of all deck names
+ */
+export async function deckNames(): Promise<string[]> {
+  return invoke<string[]>('deckNames')
+}
+
+/**
+ * Create a new note. Rejects duplicates (no allowDuplicate) so Anki's own
+ * duplicate detection applies.
+ * @returns The new note ID
+ */
+export async function addNote(
+  deckName: string,
+  modelName: string,
+  fields: Record<string, string>,
+  tags: string[],
+): Promise<number> {
+  return invoke<number>('addNote', {
+    note: { deckName, modelName, fields, tags },
+  })
+}
+
+/**
  * Find notes matching a query
  * @param query Anki search query (e.g., "deck:Default added:1")
  */
