@@ -146,6 +146,11 @@
     return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
   })
 
+  const sentenceConfigured = computed(() => {
+    const { deck, noteType, primaryField } = settings.value.anki.sentence
+    return !!deck && !!noteType && !!primaryField
+  })
+
   const showSettings = ref(false)
   type ConnectionStatus = 'untested' | 'testing' | 'connected' | 'error'
   const connectionStatus = ref<ConnectionStatus>('untested')
@@ -1334,12 +1339,28 @@
     return fields
   }
 
-  const sendSelectionToAnki = async () => {
+  const joinCleaned = (msgs: SubtitleMessage[], clean: (s: string) => string) =>
+    msgs.map((m) => clean(m.subtitle)).join(' ')
+
+  type CardFlowSelection = {
+    primaryMsgs: SubtitleMessage[]
+    secondaryMsgs: SubtitleMessage[]
+    first: SubtitleMessage | undefined
+    last: SubtitleMessage | undefined
+    mediaId: number
+  }
+
+  // Shared scaffolding for the word-card and sentence-card flows: selection and
+  // anchor bookkeeping, in-flight/error state, and the success-toast lifecycle.
+  // `run` does the flow-specific Anki work and returns the touched note id, or
+  // null to finish quietly (nothing to write).
+  const runCardFlow = async (
+    errorFallback: string,
+    successMessage: (count: number) => string,
+    run: (sel: CardFlowSelection) => Promise<number | null>,
+  ) => {
     const primaryMsgs = getSelectedMessages()
     const secondaryMsgs = getSelectedSecondaryMessages()
-    if (!ankiConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0)) return
-
-    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki.word
     const range = getSelectionRange() // primary first/last (audio/image come from primary)
     const first = range?.first
     const last = range?.last
@@ -1353,42 +1374,81 @@
     ankiError.value[anchorKey] = ''
 
     try {
-      const targetNote = await anki.getLastNote(settings.value.anki.word.noteType)
-      if (!targetNote) {
-        throw new Error('No target card found in Anki')
-      }
+      const noteId = await run({ primaryMsgs, secondaryMsgs, first, last, mediaId })
+      if (noteId === null) return
+      ankiSuccess.value[anchorKey] = true
+      const count = primaryMsgs.length + secondaryMsgs.length
+      toast.success(successMessage(count), {
+        duration: 5000,
+        action: {
+          label: 'Browse',
+          onClick: () => {
+            void anki.guiBrowse(`nid:${noteId}`)
+          },
+        },
+      })
 
-      const maxAgeMinutes = settings.value.anki.word.maxCardAgeMinutes ?? 5
-      if (maxAgeMinutes > 0) {
-        const thresholdMs = maxAgeMinutes * 60000
+      setTimeout(() => {
+        delete ankiSuccess.value[anchorKey]
+        clearSelection()
+      }, 2000)
+    } catch (err) {
+      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
+      toast.error(err instanceof Error ? err.message : errorFallback)
+    } finally {
+      delete sendingToAnki.value[anchorKey]
+    }
+  }
 
-        if (Date.now() - targetNote.noteId > thresholdMs) {
-          throw new Error(
-            `Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`,
+  const sendSelectionToAnki = async () => {
+    if (!ankiConfigured.value) return
+    await runCardFlow(
+      'Failed to add to Anki',
+      (count) => `Added ${count} subtitle(s) to Anki`,
+      async ({ primaryMsgs, secondaryMsgs, first, last, mediaId }) => {
+        const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki.word
+
+        const targetNote = await anki.getLastNote(settings.value.anki.word.noteType)
+        if (!targetNote) {
+          throw new Error('No target card found in Anki')
+        }
+
+        const maxAgeMinutes = settings.value.anki.word.maxCardAgeMinutes ?? 5
+        if (maxAgeMinutes > 0) {
+          const thresholdMs = maxAgeMinutes * 60000
+
+          if (Date.now() - targetNote.noteId > thresholdMs) {
+            throw new Error(
+              `Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`,
+            )
+          }
+        }
+
+        const fieldUpdates: Record<string, string> = {}
+
+        if (sentenceField && primaryMsgs.length > 0) {
+          const existing = targetNote.fields[sentenceField]?.value ?? ''
+          fieldUpdates[sentenceField] = preserveHtmlTags(
+            existing,
+            joinCleaned(primaryMsgs, cleanSentence),
           )
         }
-      }
 
-      const fieldUpdates: Record<string, string> = {}
+        if (secondaryField && secondaryMsgs.length > 0) {
+          const existing = targetNote.fields[secondaryField]?.value ?? ''
+          fieldUpdates[secondaryField] = preserveHtmlTags(
+            existing,
+            joinCleaned(secondaryMsgs, cleanSecondary),
+          )
+        }
 
-      if (sentenceField && primaryMsgs.length > 0) {
-        const text = primaryMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
-        const existing = targetNote.fields[sentenceField]?.value ?? ''
-        fieldUpdates[sentenceField] = preserveHtmlTags(existing, text)
-      }
+        Object.assign(
+          fieldUpdates,
+          await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+        )
 
-      if (secondaryField && secondaryMsgs.length > 0) {
-        const text = secondaryMsgs.map((m) => cleanSecondary(m.subtitle)).join(' ')
-        const existing = targetNote.fields[secondaryField]?.value ?? ''
-        fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
-      }
+        if (Object.keys(fieldUpdates).length === 0) return null
 
-      Object.assign(
-        fieldUpdates,
-        await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
-      )
-
-      if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
         const tags = settings.value.anki.word.tags
         if (tags.length > 0) {
@@ -1402,30 +1462,45 @@
             toast.warning(`Card updated, but adding tags failed: ${reason}`)
           }
         }
-        ankiSuccess.value[anchorKey] = true
-        const noteId = targetNote.noteId
-        const count = primaryMsgs.length + secondaryMsgs.length
-        toast.success(`Added ${count} subtitle(s) to Anki`, {
-          duration: 5000,
-          action: {
-            label: 'Browse',
-            onClick: () => {
-              void anki.guiBrowse(`nid:${noteId}`)
-            },
-          },
-        })
+        return targetNote.noteId
+      },
+    )
+  }
 
-        setTimeout(() => {
-          delete ankiSuccess.value[anchorKey]
-          clearSelection()
-        }, 2000)
-      }
-    } catch (err) {
-      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
-      toast.error(err instanceof Error ? err.message : 'Failed to add to Anki')
-    } finally {
-      delete sendingToAnki.value[anchorKey]
+  // Create a brand-new sentence card via addNote (no existing Yomitan card).
+  const createSentenceCard = async () => {
+    if (!sentenceConfigured.value) return
+    // Without a primary line there is no text to build the note around, and
+    // Anki rejects a note whose first field is empty.
+    if (getSelectedMessages().length === 0) {
+      toast.error('Select at least one primary-column subtitle to create a sentence card.')
+      return
     }
+    await runCardFlow(
+      'Failed to create sentence card',
+      (count) => `Created sentence card from ${count} subtitle(s)`,
+      async ({ primaryMsgs, secondaryMsgs, first, last, mediaId }) => {
+        const { deck, noteType, primaryField, secondaryField, audioField, imageField, tags } =
+          settings.value.anki.sentence
+
+        const fields: Record<string, string> = {}
+
+        if (primaryField && primaryMsgs.length > 0) {
+          fields[primaryField] = joinCleaned(primaryMsgs, cleanSentence)
+        }
+
+        if (secondaryField && secondaryMsgs.length > 0) {
+          fields[secondaryField] = joinCleaned(secondaryMsgs, cleanSecondary)
+        }
+
+        Object.assign(
+          fields,
+          await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+        )
+
+        return await anki.addNote(deck, noteType, fields, tags)
+      },
+    )
   }
 
   const requestMediaFromServer = (
@@ -1891,6 +1966,15 @@
           @click="sendSelectionToAnki"
         >
           Add to word card<template v-if="targetCardPreview">: {{ targetCardPreview }}</template>
+        </button>
+        <button
+          v-if="sentenceConfigured"
+          class="selection-btn create-btn"
+          :disabled="selectedMessages.size === 0"
+          :title="selectedMessages.size === 0 ? 'Needs at least one primary-column subtitle' : ''"
+          @click="createSentenceCard"
+        >
+          Create sentence card
         </button>
         <button
           class="selection-btn clear-btn"
@@ -3221,6 +3305,7 @@
     border-radius: 6px;
     cursor: pointer;
     font-size: 0.95em;
+    line-height: 1.2;
     color: #e9edf2;
   }
 
@@ -3235,6 +3320,14 @@
 
   .selection-btn.send-btn:hover {
     background: #38764c;
+  }
+
+  .selection-btn.create-btn {
+    background: #2d456a;
+  }
+
+  .selection-btn.create-btn:hover {
+    background: #365689;
   }
 
   .selection-btn.clear-btn {
