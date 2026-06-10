@@ -1794,10 +1794,9 @@
             <span class="selection-sub">· {{ selectedSecondary.size }} secondary</span>
           </span>
           <span v-if="loadingTargetCard" class="target-card loading">Loading card...</span>
-          <span v-else-if="targetCardPreview" class="target-card" title="Target card">
-            → {{ targetCardPreview }}
-          </span>
-          <span v-else-if="ankiConfigured" class="target-card error">No matching card found</span>
+          <span v-else-if="ankiConfigured && !targetCardPreview" class="target-card error"
+            >No matching card found</span
+          >
         </template>
         <span v-else class="selection-hint">Click on subtitles to select them for Anki</span>
       </div>
@@ -1809,7 +1808,7 @@
           "
           @click="sendSelectionToAnki"
         >
-          📝 Add to Anki
+          Add to word card: {{ targetCardPreview }}
         </button>
         <button
           class="selection-btn clear-btn"
