@@ -49,6 +49,7 @@
         secondaryField: '',
         audioField: '',
         imageField: '',
+        metadataField: '',
         tags: ['mpv-subtitleminer'],
       },
     },
@@ -265,7 +266,7 @@
   ]
 
   const sentenceFieldRows: FieldRow<
-    'primaryField' | 'secondaryField' | 'audioField' | 'imageField'
+    'primaryField' | 'secondaryField' | 'audioField' | 'imageField' | 'metadataField'
   >[] = [
     {
       key: 'primaryField',
@@ -281,6 +282,12 @@
     },
     { key: 'audioField', label: 'Audio field', emptyLabel: "Don't set" },
     { key: 'imageField', label: 'Image field', emptyLabel: "Don't set" },
+    {
+      key: 'metadataField',
+      label: 'Metadata field',
+      emptyLabel: "Don't set",
+      hint: 'Filled from the media file name, as source:<file name>',
+    },
   ]
 
   function onCardChange<S extends CardSection, K extends keyof AnkiSettings[S]>(
@@ -858,6 +865,13 @@
   // Tracks the media path the UI last reflected, so a media_changed re-sent on reconnect
   // (same path) doesn't clear the list - only an actual file change does.
   let lastMediaPath: string | null = null
+
+  // Anki metadata value for the playing media. Empty when nothing is playing.
+  function buildMetadataValue(): string {
+    if (!lastMediaPath) return ''
+    const title = titleFromMediaPath(lastMediaPath)
+    return title ? `source:${title}` : ''
+  }
 
   const ws = useWebSocket({
     host,
@@ -1480,8 +1494,16 @@
       'Failed to create sentence card',
       (count) => `Created sentence card from ${count} subtitle(s)`,
       async ({ primaryMsgs, secondaryMsgs, first, last, mediaId }) => {
-        const { deck, noteType, primaryField, secondaryField, audioField, imageField, tags } =
-          settings.value.anki.sentence
+        const {
+          deck,
+          noteType,
+          primaryField,
+          secondaryField,
+          audioField,
+          imageField,
+          metadataField,
+          tags,
+        } = settings.value.anki.sentence
 
         const fields: Record<string, string> = {}
 
@@ -1491,6 +1513,11 @@
 
         if (secondaryField && secondaryMsgs.length > 0) {
           fields[secondaryField] = joinCleaned(secondaryMsgs, cleanSecondary)
+        }
+
+        if (metadataField) {
+          const metadata = buildMetadataValue()
+          if (metadata) fields[metadataField] = metadata
         }
 
         Object.assign(

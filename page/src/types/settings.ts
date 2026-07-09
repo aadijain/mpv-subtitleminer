@@ -34,6 +34,7 @@ export interface SentenceCardSettings {
   secondaryField: string
   audioField: string
   imageField: string
+  metadataField: string
   tags: string[]
 }
 
