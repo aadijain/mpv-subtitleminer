@@ -39,17 +39,35 @@ fn parse_ass_time(s: &str) -> Option<f64> {
 }
 
 /// Converts an ASS event Text field to display text: drops `{...}` override
-/// blocks and converts hard breaks (`\N`, `\n`) to newlines and hard spaces
-/// (`\h`) to spaces.
+/// blocks and any text in `\p` drawing mode (vector path commands for signs
+/// and masks, e.g. `m -64 64 l -60 35 ...`), and converts hard breaks (`\N`,
+/// `\n`) to newlines and hard spaces (`\h`) to spaces.
 fn strip_ass_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_override = false;
+    let mut in_drawing = false;
     while let Some(c) = chars.next() {
         match c {
             '{' => in_override = true,
             '}' => in_override = false,
-            _ if in_override => {}
+            _ if in_override => {
+                // `\p<n>` toggles drawing mode: >0 turns the following event
+                // text into path commands, 0 returns to text. `\pos`/`\pbo`
+                // have no digit after the `p`, so they never match.
+                if c == '\\' && chars.peek() == Some(&'p') {
+                    chars.next();
+                    let mut scale: Option<u32> = None;
+                    while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
+                        scale = Some(scale.unwrap_or(0).saturating_mul(10).saturating_add(d));
+                        chars.next();
+                    }
+                    if let Some(scale) = scale {
+                        in_drawing = scale > 0;
+                    }
+                }
+            }
+            _ if in_drawing => {}
             '\\' => match chars.peek() {
                 Some('N') | Some('n') => {
                     out.push('\n');
@@ -671,6 +689,19 @@ mod tests {
         assert_eq!(strip_ass_text("plain"), "plain");
         // backslash not introducing a known escape is kept verbatim
         assert_eq!(strip_ass_text("a\\xb"), "a\\xb");
+    }
+
+    #[test]
+    fn strip_ass_text_drops_drawing_mode() {
+        // A pure drawing event (typeset sign/mask) strips to nothing.
+        assert_eq!(strip_ass_text("{\\p1}m -64 64 l -60 35 17 -32{\\p0}"), "");
+        // Unterminated drawing mode drops the rest of the line.
+        assert_eq!(strip_ass_text("{\\an7\\p1}m 0 0 l 100 0 100 100"), "");
+        // Higher scales are still drawing mode; \p0 returns to text.
+        assert_eq!(strip_ass_text("{\\p4}m 0 0 l 8 0{\\p0}after"), "after");
+        // \pos and \pbo are not drawing toggles.
+        assert_eq!(strip_ass_text("{\\pos(400,570)}Hello"), "Hello");
+        assert_eq!(strip_ass_text("{\\pbo-4}Hello"), "Hello");
     }
 
     #[test]
