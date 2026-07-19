@@ -187,7 +187,6 @@
       secondaryField: '',
       audioField: '',
       imageField: '',
-      maxCardAgeMinutes: 5,
     }
   }
 
