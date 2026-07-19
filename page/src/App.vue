@@ -1207,7 +1207,10 @@
         fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
       }
 
-      if (audioField && first && last) {
+      // Audio and image touch separate requests and separate fieldUpdates
+      // keys, so they can be fetched and stored concurrently.
+      const audioTask = async () => {
+        if (!(audioField && first && last)) return
         if (primaryMsgs.length > 1) {
           const selectionPort = first.sourcePort
           const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
@@ -1227,7 +1230,8 @@
         }
       }
 
-      if (imageField && first && last) {
+      const imageTask = async () => {
+        if (!(imageField && first && last)) return
         let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
 
         if (!imageData) {
@@ -1243,6 +1247,8 @@
           fieldUpdates[imageField] = `<img src="${filename}">`
         }
       }
+
+      await Promise.all([audioTask(), imageTask()])
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
