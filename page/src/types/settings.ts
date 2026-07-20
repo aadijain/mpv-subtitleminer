@@ -16,7 +16,7 @@ export interface MediaSettings {
   audioAdvancedExtension: string
 }
 
-export interface AnkiSettings {
+export interface WordCardSettings {
   noteType: string
   frontField: string
   sentenceField: string
@@ -25,6 +25,22 @@ export interface AnkiSettings {
   imageField: string
   maxCardAgeMinutes: number
   tags: string[]
+}
+
+export interface SentenceCardSettings {
+  deck: string
+  noteType: string
+  primaryField: string
+  secondaryField: string
+  audioField: string
+  imageField: string
+  metadataField: string
+  tags: string[]
+}
+
+export interface AnkiSettings {
+  word: WordCardSettings
+  sentence: SentenceCardSettings
 }
 
 export interface ConnectionSettings {

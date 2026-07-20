@@ -1,4 +1,5 @@
 <script setup lang="ts">
+  import FieldSelect from './components/FieldSelect.vue'
   import MediaConfiguration from './components/MediaConfiguration.vue'
   import {
     computed,
@@ -20,6 +21,7 @@
     DisplaySettings,
     MediaSettings,
     Settings,
+    WordCardSettings,
   } from './types/settings'
   import { preserveHtmlTags } from './utils/htmlUtils'
 
@@ -30,14 +32,26 @@
   const STORAGE_KEY = 'mpv_subtitle_tool_settings'
   const defaultSettings: Settings = {
     anki: {
-      noteType: '',
-      frontField: '',
-      sentenceField: '',
-      secondaryField: '',
-      audioField: '',
-      imageField: '',
-      maxCardAgeMinutes: 5,
-      tags: ['mpv-subtitleminer'],
+      word: {
+        noteType: '',
+        frontField: '',
+        sentenceField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
+        maxCardAgeMinutes: 5,
+        tags: ['mpv-subtitleminer'],
+      },
+      sentence: {
+        deck: '',
+        noteType: '',
+        primaryField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
+        metadataField: '',
+        tags: ['mpv-subtitleminer'],
+      },
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
@@ -76,11 +90,24 @@
     try {
       const stored = localStorage.getItem(STORAGE_KEY)
       if (stored) {
-        const parsed = JSON.parse(stored) as Settings
+        // Stored settings may predate the word/sentence split, where the
+        // word-card config lived flat on `anki` (noteType, fields, ...).
+        type StoredSettings = Omit<Partial<Settings>, 'anki'> & {
+          anki?: Partial<Settings['anki']> & Partial<WordCardSettings>
+        }
+        const parsed = JSON.parse(stored) as StoredSettings
+        // One-time migration of the pre-split flat shape into `word`.
+        const legacyWord =
+          parsed.anki && !parsed.anki.word && parsed.anki.noteType !== undefined
+            ? parsed.anki
+            : undefined
         return {
           ...defaultSettings,
           ...parsed,
-          anki: { ...defaultSettings.anki, ...parsed.anki },
+          anki: {
+            word: { ...defaultSettings.anki.word, ...(parsed.anki?.word ?? legacyWord ?? {}) },
+            sentence: { ...defaultSettings.anki.sentence, ...(parsed.anki?.sentence ?? {}) },
+          },
           connection: { ...defaultSettings.connection, ...parsed.connection },
           display: { ...defaultSettings.display, ...(parsed.display ?? {}) },
           media: { ...defaultSettings.media, ...parsed.media },
@@ -106,9 +133,23 @@
     { deep: true },
   )
 
+  // Deep-copy so editing the local form doesn't mutate saved settings by reference.
+  function cloneAnki(a: AnkiSettings): AnkiSettings {
+    return {
+      word: { ...a.word, tags: [...a.word.tags] },
+      sentence: { ...a.sentence, tags: [...a.sentence.tags] },
+    }
+  }
+
   const ankiConfigured = computed(() => {
-    const { noteType, sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    const { noteType, sentenceField, secondaryField, audioField, imageField } =
+      settings.value.anki.word
     return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
+  })
+
+  const sentenceConfigured = computed(() => {
+    const { deck, noteType, primaryField } = settings.value.anki.sentence
+    return !!deck && !!noteType && !!primaryField
   })
 
   const showSettings = ref(false)
@@ -117,9 +158,10 @@
   const ankiVersion = ref<number | null>(null)
   const connectionError = ref<string | null>(null)
   const modelsWithFields = ref<Record<string, string[]>>({})
+  const deckNamesList = ref<string[]>([])
   const loadingModels = ref(false)
   const modelsError = ref<string | null>(null)
-  const localSettings = ref<AnkiSettings>({ ...settings.value.anki })
+  const localSettings = ref<AnkiSettings>(cloneAnki(settings.value.anki))
   const localConnection = ref<ConnectionSettings>({ ...settings.value.connection })
   const localMedia = ref<MediaSettings>({ ...settings.value.media })
   const localDisplay = ref<DisplaySettings>({ ...settings.value.display })
@@ -127,14 +169,14 @@
   // Raw tag-field text, kept as typed (like localPortInput) so re-rendering the
   // parsed tag list never rewrites the input and jumps the cursor.
   const wordTagsInput = ref('')
+  const sentenceTagsInput = ref('')
 
   const modelNames = computed(() => Object.keys(modelsWithFields.value).sort())
-  const availableFields = computed(() => {
-    const model = localSettings.value.noteType
-    return model ? (modelsWithFields.value[model] ?? []) : []
-  })
+  const fieldsFor = (noteType: string): string[] =>
+    noteType ? (modelsWithFields.value[noteType] ?? []) : []
   const settingsValid = computed(() => {
-    const { noteType, sentenceField, secondaryField, audioField, imageField } = localSettings.value
+    const { noteType, sentenceField, secondaryField, audioField, imageField } =
+      localSettings.value.word
     // Allow saving if Anki is not configured
     if (!noteType) return true
     return !!sentenceField || !!secondaryField || !!audioField || !!imageField
@@ -142,12 +184,13 @@
 
   watch(showSettings, (isOpen) => {
     if (isOpen) {
-      localSettings.value = { ...settings.value.anki }
+      localSettings.value = cloneAnki(settings.value.anki)
       localConnection.value = { ...settings.value.connection }
       localMedia.value = { ...settings.value.media }
       localDisplay.value = { ...settings.value.display }
       localPortInput.value = localConnection.value.ports.join(', ')
-      wordTagsInput.value = localSettings.value.tags.join(' ')
+      wordTagsInput.value = localSettings.value.word.tags.join(' ')
+      sentenceTagsInput.value = localSettings.value.sentence.tags.join(' ')
       if (connectionStatus.value === 'untested') {
         void testConnection()
       }
@@ -175,7 +218,9 @@
     modelsError.value = null
 
     try {
-      modelsWithFields.value = await anki.getModelsWithFields()
+      const [models, decks] = await Promise.all([anki.getModelsWithFields(), anki.deckNames()])
+      modelsWithFields.value = models
+      deckNamesList.value = [...decks].sort()
     } catch (err) {
       modelsError.value = err instanceof Error ? err.message : 'Failed to load models'
     } finally {
@@ -188,26 +233,95 @@
     return value.split(/\s+/).filter(Boolean)
   }
 
-  function updateWordTags(raw: string) {
-    wordTagsInput.value = raw
-    onFieldChange('tags', parseTags(raw))
-  }
+  // Anki-field pickers per card section, rendered via FieldSelect. The rows
+  // also drive the field reset on note-type change so the two can't drift.
+  // Word rows update an existing note ("Don't update"); sentence rows fill a
+  // brand-new note ("Don't set").
+  type CardSection = 'word' | 'sentence'
+  type FieldRow<K> = { key: K; label: string; emptyLabel: string; hint?: string }
 
-  function onModelChange(value: string) {
+  const wordFieldRows: FieldRow<
+    'frontField' | 'sentenceField' | 'secondaryField' | 'audioField' | 'imageField'
+  >[] = [
+    {
+      key: 'frontField',
+      label: 'Front field',
+      emptyLabel: 'Select…',
+      hint: 'Used to find the target card',
+    },
+    {
+      key: 'sentenceField',
+      label: 'Sentence field',
+      emptyLabel: "Don't update",
+      hint: 'Filled from the primary column selection',
+    },
+    {
+      key: 'secondaryField',
+      label: 'Secondary sentence field',
+      emptyLabel: "Don't update",
+      hint: 'Filled from the secondary column selection',
+    },
+    { key: 'audioField', label: 'Audio field', emptyLabel: "Don't update" },
+    { key: 'imageField', label: 'Image field', emptyLabel: "Don't update" },
+  ]
+
+  const sentenceFieldRows: FieldRow<
+    'primaryField' | 'secondaryField' | 'audioField' | 'imageField' | 'metadataField'
+  >[] = [
+    {
+      key: 'primaryField',
+      label: 'Primary sentence field',
+      emptyLabel: 'Select…',
+      hint: 'Filled from the primary column selection',
+    },
+    {
+      key: 'secondaryField',
+      label: 'Secondary sentence field',
+      emptyLabel: "Don't set",
+      hint: 'Filled from the secondary column selection',
+    },
+    { key: 'audioField', label: 'Audio field', emptyLabel: "Don't set" },
+    { key: 'imageField', label: 'Image field', emptyLabel: "Don't set" },
+    {
+      key: 'metadataField',
+      label: 'Metadata field',
+      emptyLabel: "Don't set",
+      hint: 'Filled from the media file name, as source:<file name>',
+    },
+  ]
+
+  function onCardChange<S extends CardSection, K extends keyof AnkiSettings[S]>(
+    section: S,
+    field: K,
+    value: AnkiSettings[S][K],
+  ) {
     localSettings.value = {
       ...localSettings.value,
-      noteType: value,
-      frontField: '',
-      sentenceField: '',
-      secondaryField: '',
-      audioField: '',
-      imageField: '',
+      [section]: { ...localSettings.value[section], [field]: value },
     }
   }
 
-  function onFieldChange(field: keyof AnkiSettings, value: string | number | string[]) {
-    // @ts-ignore - dynamic assignment
-    localSettings.value = { ...localSettings.value, [field]: value }
+  const cardTagsInput: Record<CardSection, Ref<string>> = {
+    word: wordTagsInput,
+    sentence: sentenceTagsInput,
+  }
+
+  function updateCardTags(section: CardSection, raw: string) {
+    cardTagsInput[section].value = raw
+    onCardChange(section, 'tags', parseTags(raw))
+  }
+
+  function onCardModelChange(section: CardSection, value: string) {
+    onCardChange(section, 'noteType', value)
+    if (section === 'word') {
+      for (const row of wordFieldRows) {
+        onCardChange('word', row.key, '')
+      }
+    } else {
+      for (const row of sentenceFieldRows) {
+        onCardChange('sentence', row.key, '')
+      }
+    }
   }
 
   function saveSettings() {
@@ -234,7 +348,7 @@
       localMedia.value.imageAnimated = false
     }
 
-    settings.value.anki = { ...localSettings.value }
+    settings.value.anki = cloneAnki(localSettings.value)
     settings.value.connection = { ...localConnection.value }
     settings.value.media = { ...localMedia.value }
     settings.value.display = { ...localDisplay.value }
@@ -752,6 +866,13 @@
   // (same path) doesn't clear the list - only an actual file change does.
   let lastMediaPath: string | null = null
 
+  // Anki metadata value for the playing media. Empty when nothing is playing.
+  function buildMetadataValue(): string {
+    if (!lastMediaPath) return ''
+    const title = titleFromMediaPath(lastMediaPath)
+    return title ? `source:${title}` : ''
+  }
+
   const ws = useWebSocket({
     host,
     ports,
@@ -978,7 +1099,7 @@
 
     loadingTargetCard.value = true
     try {
-      const { noteType, frontField } = settings.value.anki
+      const { noteType, frontField } = settings.value.anki.word
       const targetNote = await anki.getLastNote(noteType)
 
       if (targetNote) {
@@ -1173,12 +1294,87 @@
     return `mpv_subtitleminer_${msgId}_${timestamp}.${ext.toLowerCase()}`
   }
 
-  const sendSelectionToAnki = async () => {
+  // Fetch/store the audio clip and thumbnail for the selection and return the
+  // resulting field -> value map (e.g. `[sound:...]`, `<img>`). Shared by the
+  // word and sentence card flows; each passes its own audio/image field names.
+  async function buildMediaFields(
+    primaryMsgs: SubtitleMessage[],
+    first: SubtitleMessage | undefined,
+    last: SubtitleMessage | undefined,
+    mediaId: number,
+    audioField: string,
+    imageField: string,
+  ): Promise<Record<string, string>> {
+    const fields: Record<string, string> = {}
+    if (!first || !last) return fields
+
+    // Audio and image touch separate requests and separate field keys, so
+    // they can be fetched and stored concurrently.
+    const audioTask = async () => {
+      if (!audioField) return
+      if (primaryMsgs.length > 1) {
+        const selectionPort = first.sourcePort
+        const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
+        if (!allSamePort) {
+          throw new Error('Selected subtitles must come from the same connection for audio.')
+        }
+      }
+      const audioData =
+        primaryMsgs.length > 1
+          ? await requestAudioRange(first.id, last.id, first.sourcePort)
+          : first.audio || (await requestMediaFromServer(first, 'audio'))
+
+      if (audioData) {
+        const filename = generateMediaFilename(mediaId, 'audio')
+        await anki.storeMediaFile(filename, audioData)
+        fields[audioField] = `[sound:${filename}]`
+      }
+    }
+
+    const imageTask = async () => {
+      if (!imageField) return
+      let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
+
+      if (!imageData) {
+        imageData = await requestMediaFromServer(
+          first,
+          'thumbnail',
+          primaryMsgs.length > 1 ? last.id : undefined,
+        )
+      }
+      if (imageData) {
+        const filename = generateMediaFilename(mediaId, 'image')
+        await anki.storeMediaFile(filename, imageData)
+        fields[imageField] = `<img src="${filename}">`
+      }
+    }
+
+    await Promise.all([audioTask(), imageTask()])
+    return fields
+  }
+
+  const joinCleaned = (msgs: SubtitleMessage[], clean: (s: string) => string) =>
+    msgs.map((m) => clean(m.subtitle)).join(' ')
+
+  type CardFlowSelection = {
+    primaryMsgs: SubtitleMessage[]
+    secondaryMsgs: SubtitleMessage[]
+    first: SubtitleMessage | undefined
+    last: SubtitleMessage | undefined
+    mediaId: number
+  }
+
+  // Shared scaffolding for the word-card and sentence-card flows: selection and
+  // anchor bookkeeping, in-flight/error state, and the success-toast lifecycle.
+  // `run` does the flow-specific Anki work and returns the touched note id, or
+  // null to finish quietly (nothing to write).
+  const runCardFlow = async (
+    errorFallback: string,
+    successMessage: (count: number) => string,
+    run: (sel: CardFlowSelection) => Promise<number | null>,
+  ) => {
     const primaryMsgs = getSelectedMessages()
     const secondaryMsgs = getSelectedSecondaryMessages()
-    if (!ankiConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0)) return
-
-    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki
     const range = getSelectionRange() // primary first/last (audio/image come from primary)
     const first = range?.first
     const last = range?.last
@@ -1192,82 +1388,83 @@
     ankiError.value[anchorKey] = ''
 
     try {
-      const targetNote = await anki.getLastNote(settings.value.anki.noteType)
-      if (!targetNote) {
-        throw new Error('No target card found in Anki')
-      }
+      const noteId = await run({ primaryMsgs, secondaryMsgs, first, last, mediaId })
+      if (noteId === null) return
+      ankiSuccess.value[anchorKey] = true
+      const count = primaryMsgs.length + secondaryMsgs.length
+      toast.success(successMessage(count), {
+        duration: 5000,
+        action: {
+          label: 'Browse',
+          onClick: () => {
+            void anki.guiBrowse(`nid:${noteId}`)
+          },
+        },
+      })
 
-      const maxAgeMinutes = settings.value.anki.maxCardAgeMinutes ?? 5
-      if (maxAgeMinutes > 0) {
-        const thresholdMs = maxAgeMinutes * 60000
+      setTimeout(() => {
+        delete ankiSuccess.value[anchorKey]
+        clearSelection()
+      }, 2000)
+    } catch (err) {
+      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
+      toast.error(err instanceof Error ? err.message : errorFallback)
+    } finally {
+      delete sendingToAnki.value[anchorKey]
+    }
+  }
 
-        if (Date.now() - targetNote.noteId > thresholdMs) {
-          throw new Error(
-            `Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`,
-          )
+  const sendSelectionToAnki = async () => {
+    if (!ankiConfigured.value) return
+    await runCardFlow(
+      'Failed to add to Anki',
+      (count) => `Added ${count} subtitle(s) to Anki`,
+      async ({ primaryMsgs, secondaryMsgs, first, last, mediaId }) => {
+        const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki.word
+
+        const targetNote = await anki.getLastNote(settings.value.anki.word.noteType)
+        if (!targetNote) {
+          throw new Error('No target card found in Anki')
         }
-      }
 
-      const fieldUpdates: Record<string, string> = {}
+        const maxAgeMinutes = settings.value.anki.word.maxCardAgeMinutes ?? 5
+        if (maxAgeMinutes > 0) {
+          const thresholdMs = maxAgeMinutes * 60000
 
-      if (sentenceField && primaryMsgs.length > 0) {
-        const text = primaryMsgs.map((m) => cleanSentence(m.subtitle)).join(' ')
-        const existing = targetNote.fields[sentenceField]?.value ?? ''
-        fieldUpdates[sentenceField] = preserveHtmlTags(existing, text)
-      }
-
-      if (secondaryField && secondaryMsgs.length > 0) {
-        const text = secondaryMsgs.map((m) => cleanSecondary(m.subtitle)).join(' ')
-        const existing = targetNote.fields[secondaryField]?.value ?? ''
-        fieldUpdates[secondaryField] = preserveHtmlTags(existing, text)
-      }
-
-      // Audio and image touch separate requests and separate fieldUpdates
-      // keys, so they can be fetched and stored concurrently.
-      const audioTask = async () => {
-        if (!(audioField && first && last)) return
-        if (primaryMsgs.length > 1) {
-          const selectionPort = first.sourcePort
-          const allSamePort = primaryMsgs.every((msg) => msg.sourcePort === selectionPort)
-          if (!allSamePort) {
-            throw new Error('Selected subtitles must come from the same connection for audio.')
+          if (Date.now() - targetNote.noteId > thresholdMs) {
+            throw new Error(
+              `Cannot add to card: The latest card is too old (> ${maxAgeMinutes} minutes).`,
+            )
           }
         }
-        const audioData =
-          primaryMsgs.length > 1
-            ? await requestAudioRange(first.id, last.id, first.sourcePort)
-            : first.audio || (await requestMediaFromServer(first, 'audio'))
 
-        if (audioData) {
-          const filename = generateMediaFilename(mediaId, 'audio')
-          await anki.storeMediaFile(filename, audioData)
-          fieldUpdates[audioField] = `[sound:${filename}]`
-        }
-      }
+        const fieldUpdates: Record<string, string> = {}
 
-      const imageTask = async () => {
-        if (!(imageField && first && last)) return
-        let imageData = primaryMsgs.length === 1 ? first.thumbnail : undefined
-
-        if (!imageData) {
-          imageData = await requestMediaFromServer(
-            first,
-            'thumbnail',
-            primaryMsgs.length > 1 ? last.id : undefined,
+        if (sentenceField && primaryMsgs.length > 0) {
+          const existing = targetNote.fields[sentenceField]?.value ?? ''
+          fieldUpdates[sentenceField] = preserveHtmlTags(
+            existing,
+            joinCleaned(primaryMsgs, cleanSentence),
           )
         }
-        if (imageData) {
-          const filename = generateMediaFilename(mediaId, 'image')
-          await anki.storeMediaFile(filename, imageData)
-          fieldUpdates[imageField] = `<img src="${filename}">`
+
+        if (secondaryField && secondaryMsgs.length > 0) {
+          const existing = targetNote.fields[secondaryField]?.value ?? ''
+          fieldUpdates[secondaryField] = preserveHtmlTags(
+            existing,
+            joinCleaned(secondaryMsgs, cleanSecondary),
+          )
         }
-      }
 
-      await Promise.all([audioTask(), imageTask()])
+        Object.assign(
+          fieldUpdates,
+          await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+        )
 
-      if (Object.keys(fieldUpdates).length > 0) {
+        if (Object.keys(fieldUpdates).length === 0) return null
+
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
-        const tags = settings.value.anki.tags
+        const tags = settings.value.anki.word.tags
         if (tags.length > 0) {
           // The fields are already committed at this point, so a tagging
           // failure must not be reported as a failed send (which would invite
@@ -1279,30 +1476,58 @@
             toast.warning(`Card updated, but adding tags failed: ${reason}`)
           }
         }
-        ankiSuccess.value[anchorKey] = true
-        const noteId = targetNote.noteId
-        const count = primaryMsgs.length + secondaryMsgs.length
-        toast.success(`Added ${count} subtitle(s) to Anki`, {
-          duration: 5000,
-          action: {
-            label: 'Browse',
-            onClick: () => {
-              void anki.guiBrowse(`nid:${noteId}`)
-            },
-          },
-        })
+        return targetNote.noteId
+      },
+    )
+  }
 
-        setTimeout(() => {
-          delete ankiSuccess.value[anchorKey]
-          clearSelection()
-        }, 2000)
-      }
-    } catch (err) {
-      ankiError.value[anchorKey] = err instanceof Error ? err.message : 'Unknown error'
-      toast.error(err instanceof Error ? err.message : 'Failed to add to Anki')
-    } finally {
-      delete sendingToAnki.value[anchorKey]
+  // Create a brand-new sentence card via addNote (no existing Yomitan card).
+  const createSentenceCard = async () => {
+    if (!sentenceConfigured.value) return
+    // Without a primary line there is no text to build the note around, and
+    // Anki rejects a note whose first field is empty.
+    if (getSelectedMessages().length === 0) {
+      toast.error('Select at least one primary-column subtitle to create a sentence card.')
+      return
     }
+    await runCardFlow(
+      'Failed to create sentence card',
+      (count) => `Created sentence card from ${count} subtitle(s)`,
+      async ({ primaryMsgs, secondaryMsgs, first, last, mediaId }) => {
+        const {
+          deck,
+          noteType,
+          primaryField,
+          secondaryField,
+          audioField,
+          imageField,
+          metadataField,
+          tags,
+        } = settings.value.anki.sentence
+
+        const fields: Record<string, string> = {}
+
+        if (primaryField && primaryMsgs.length > 0) {
+          fields[primaryField] = joinCleaned(primaryMsgs, cleanSentence)
+        }
+
+        if (secondaryField && secondaryMsgs.length > 0) {
+          fields[secondaryField] = joinCleaned(secondaryMsgs, cleanSecondary)
+        }
+
+        if (metadataField) {
+          const metadata = buildMetadataValue()
+          if (metadata) fields[metadataField] = metadata
+        }
+
+        Object.assign(
+          fields,
+          await buildMediaFields(primaryMsgs, first, last, mediaId, audioField, imageField),
+        )
+
+        return await anki.addNote(deck, noteType, fields, tags)
+      },
+    )
   }
 
   const requestMediaFromServer = (
@@ -1770,6 +1995,15 @@
           Add to word card<template v-if="targetCardPreview">: {{ targetCardPreview }}</template>
         </button>
         <button
+          v-if="sentenceConfigured"
+          class="selection-btn create-btn"
+          :disabled="selectedMessages.size === 0"
+          :title="selectedMessages.size === 0 ? 'Needs at least one primary-column subtitle' : ''"
+          @click="createSentenceCard"
+        >
+          Create sentence card
+        </button>
+        <button
           class="selection-btn clear-btn"
           :disabled="selectedMessages.size === 0 && selectedSecondary.size === 0"
           @click="clearSelection"
@@ -1852,21 +2086,27 @@
 
             <section class="section">
               <div class="section-header">
-                <h3>Card configuration</h3>
+                <h3>Word mining</h3>
                 <span v-if="connectionStatus !== 'connected'" class="subtle"
                   >Connect first to load models</span
                 >
               </div>
 
               <div v-if="connectionStatus !== 'connected'" class="muted-box">
-                Connect to Anki to configure card settings.
+                Connect to Anki to configure word cards.
               </div>
               <div v-else class="form-grid">
+                <p class="hint" style="grid-column: 1 / -1">
+                  Adds the selected subtitles to your most recently created Yomitan card.
+                </p>
+
                 <label class="form-group">
                   <span>Note type</span>
                   <select
-                    :value="localSettings.noteType"
-                    @change="(e) => onModelChange((e.target as HTMLSelectElement).value)"
+                    :value="localSettings.word.noteType"
+                    @change="
+                      (e) => onCardModelChange('word', (e.target as HTMLSelectElement).value)
+                    "
                   >
                     <option value="">Select a note type…</option>
                     <option v-for="model in modelNames" :key="model" :value="model">
@@ -1875,85 +2115,17 @@
                   </select>
                 </label>
 
-                <template v-if="localSettings.noteType">
-                  <label class="form-group">
-                    <span>Front field</span>
-                    <select
-                      :value="localSettings.frontField"
-                      @change="
-                        (e) => onFieldChange('frontField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Select…</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Used to find the target card</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Sentence field</span>
-                    <select
-                      :value="localSettings.sentenceField"
-                      @change="
-                        (e) => onFieldChange('sentenceField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Filled from the primary column selection</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Secondary sentence field</span>
-                    <select
-                      :value="localSettings.secondaryField"
-                      @change="
-                        (e) =>
-                          onFieldChange('secondaryField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Filled from the secondary column selection</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Audio field</span>
-                    <select
-                      :value="localSettings.audioField"
-                      @change="
-                        (e) => onFieldChange('audioField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Image field</span>
-                    <select
-                      :value="localSettings.imageField"
-                      @change="
-                        (e) => onFieldChange('imageField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                  </label>
+                <template v-if="localSettings.word.noteType">
+                  <FieldSelect
+                    v-for="row in wordFieldRows"
+                    :key="row.key"
+                    :label="row.label"
+                    :model-value="localSettings.word[row.key]"
+                    :options="fieldsFor(localSettings.word.noteType)"
+                    :empty-label="row.emptyLabel"
+                    :hint="row.hint"
+                    @update:model-value="(v: string) => onCardChange('word', row.key, v)"
+                  />
 
                   <label class="form-group">
                     <span>Max card age (minutes)</span>
@@ -1961,10 +2133,11 @@
                       type="number"
                       min="0"
                       step="0.1"
-                      :value="localSettings.maxCardAgeMinutes"
+                      :value="localSettings.word.maxCardAgeMinutes"
                       @input="
                         (e) =>
-                          onFieldChange(
+                          onCardChange(
+                            'word',
                             'maxCardAgeMinutes',
                             parseFloat((e.target as HTMLInputElement).value) || 0,
                           )
@@ -1981,15 +2154,95 @@
                       type="text"
                       :value="wordTagsInput"
                       placeholder="mpv-subtitleminer"
-                      @input="(e) => updateWordTags((e.target as HTMLInputElement).value)"
+                      @input="(e) => updateCardTags('word', (e.target as HTMLInputElement).value)"
                     />
                     <small class="field-hint"
-                      >Space-separated tags added to every card created or updated (leave blank for
-                      none).</small
+                      >Space-separated tags added to word cards (leave blank for none).</small
                     >
                   </label>
                 </template>
                 <div v-if="loadingModels" class="muted-box">Loading note types…</div>
+                <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-header">
+                <h3>Sentence mining</h3>
+                <span v-if="connectionStatus !== 'connected'" class="subtle"
+                  >Connect first to load decks</span
+                >
+              </div>
+
+              <div v-if="connectionStatus !== 'connected'" class="muted-box">
+                Connect to Anki to configure sentence cards.
+              </div>
+              <div v-else class="form-grid">
+                <p class="hint" style="grid-column: 1 / -1">
+                  Creates a brand-new card from the selected subtitles (no Yomitan card needed).
+                </p>
+
+                <div class="form-row-2">
+                  <label class="form-group">
+                    <span>Deck</span>
+                    <select
+                      :value="localSettings.sentence.deck"
+                      @change="
+                        (e) =>
+                          onCardChange('sentence', 'deck', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select a deck…</option>
+                      <option v-for="deck in deckNamesList" :key="deck" :value="deck">
+                        {{ deck }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <label class="form-group">
+                    <span>Note type</span>
+                    <select
+                      :value="localSettings.sentence.noteType"
+                      @change="
+                        (e) => onCardModelChange('sentence', (e.target as HTMLSelectElement).value)
+                      "
+                    >
+                      <option value="">Select a note type…</option>
+                      <option v-for="model in modelNames" :key="model" :value="model">
+                        {{ model }}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+
+                <template v-if="localSettings.sentence.noteType">
+                  <FieldSelect
+                    v-for="row in sentenceFieldRows"
+                    :key="row.key"
+                    :label="row.label"
+                    :model-value="localSettings.sentence[row.key]"
+                    :options="fieldsFor(localSettings.sentence.noteType)"
+                    :empty-label="row.emptyLabel"
+                    :hint="row.hint"
+                    @update:model-value="(v: string) => onCardChange('sentence', row.key, v)"
+                  />
+
+                  <label class="form-group">
+                    <span>Tags</span>
+                    <input
+                      type="text"
+                      :value="sentenceTagsInput"
+                      placeholder="mpv-subtitleminer"
+                      @input="
+                        (e) => updateCardTags('sentence', (e.target as HTMLInputElement).value)
+                      "
+                    />
+                    <small class="field-hint"
+                      >Space-separated tags added to sentence cards (leave blank for none).</small
+                    >
+                  </label>
+                </template>
+                <div v-if="loadingModels" class="muted-box">Loading decks and note types…</div>
                 <div v-else-if="modelsError" class="error-text">{{ modelsError }}</div>
               </div>
             </section>
@@ -3079,6 +3332,7 @@
     border-radius: 6px;
     cursor: pointer;
     font-size: 0.95em;
+    line-height: 1.2;
     color: #e9edf2;
   }
 
@@ -3093,6 +3347,14 @@
 
   .selection-btn.send-btn:hover {
     background: #38764c;
+  }
+
+  .selection-btn.create-btn {
+    background: #2d456a;
+  }
+
+  .selection-btn.create-btn:hover {
+    background: #365689;
   }
 
   .selection-btn.clear-btn {
@@ -3212,6 +3474,15 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 10px;
+  }
+
+  /* Full-width row inside .form-grid for two fields that belong together. */
+  .form-row-2 {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    min-width: 0;
   }
 
   .form-group {
