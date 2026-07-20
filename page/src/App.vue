@@ -3078,7 +3078,7 @@
     background: #12171e;
     border: 1px solid #2a303a;
     border-radius: 10px;
-    width: min(540px, 92vw);
+    width: min(640px, 92vw);
     max-height: 90vh;
     display: flex;
     flex-direction: column;
@@ -3179,6 +3179,9 @@
     flex-direction: column;
     gap: 6px;
     color: #cfd7e3;
+    /* A flex item is at least as wide as its content, and a select is as wide
+       as its longest option (deck and note-type names get long). */
+    min-width: 0;
   }
 
   .form-group select,
@@ -3188,6 +3191,8 @@
     color: #e9edf2;
     padding: 8px 10px;
     border-radius: 6px;
+    width: 100%;
+    min-width: 0;
   }
 
   .form-group input:disabled {
