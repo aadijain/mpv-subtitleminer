@@ -21,6 +21,7 @@
     DisplaySettings,
     MediaSettings,
     Settings,
+    WordCardSettings,
   } from './types/settings'
   import { preserveHtmlTags } from './utils/htmlUtils'
 
@@ -31,14 +32,16 @@
   const STORAGE_KEY = 'mpv_subtitle_tool_settings'
   const defaultSettings: Settings = {
     anki: {
-      noteType: '',
-      frontField: '',
-      sentenceField: '',
-      secondaryField: '',
-      audioField: '',
-      imageField: '',
-      maxCardAgeMinutes: 5,
-      tags: ['mpv-subtitleminer'],
+      word: {
+        noteType: '',
+        frontField: '',
+        sentenceField: '',
+        secondaryField: '',
+        audioField: '',
+        imageField: '',
+        maxCardAgeMinutes: 5,
+        tags: ['mpv-subtitleminer'],
+      },
     },
     connection: { host: '127.0.0.1', ports: [...DEFAULT_PORTS] },
     display: {
@@ -77,11 +80,23 @@
     try {
       const stored = localStorage.getItem(STORAGE_KEY)
       if (stored) {
-        const parsed = JSON.parse(stored) as Settings
+        // Stored settings may predate the word/sentence split, where the
+        // word-card config lived flat on `anki` (noteType, fields, ...).
+        type StoredSettings = Omit<Partial<Settings>, 'anki'> & {
+          anki?: Partial<Settings['anki']> & Partial<WordCardSettings>
+        }
+        const parsed = JSON.parse(stored) as StoredSettings
+        // One-time migration of the pre-split flat shape into `word`.
+        const legacyWord =
+          parsed.anki && !parsed.anki.word && parsed.anki.noteType !== undefined
+            ? parsed.anki
+            : undefined
         return {
           ...defaultSettings,
           ...parsed,
-          anki: { ...defaultSettings.anki, ...parsed.anki },
+          anki: {
+            word: { ...defaultSettings.anki.word, ...(parsed.anki?.word ?? legacyWord ?? {}) },
+          },
           connection: { ...defaultSettings.connection, ...parsed.connection },
           display: { ...defaultSettings.display, ...(parsed.display ?? {}) },
           media: { ...defaultSettings.media, ...parsed.media },
@@ -107,8 +122,16 @@
     { deep: true },
   )
 
+  // Deep-copy so editing the local form doesn't mutate saved settings by reference.
+  function cloneAnki(a: AnkiSettings): AnkiSettings {
+    return {
+      word: { ...a.word, tags: [...a.word.tags] },
+    }
+  }
+
   const ankiConfigured = computed(() => {
-    const { noteType, sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    const { noteType, sentenceField, secondaryField, audioField, imageField } =
+      settings.value.anki.word
     return !!noteType && (!!sentenceField || !!secondaryField || !!audioField || !!imageField)
   })
 
@@ -120,7 +143,7 @@
   const modelsWithFields = ref<Record<string, string[]>>({})
   const loadingModels = ref(false)
   const modelsError = ref<string | null>(null)
-  const localSettings = ref<AnkiSettings>({ ...settings.value.anki })
+  const localSettings = ref<AnkiSettings>(cloneAnki(settings.value.anki))
   const localConnection = ref<ConnectionSettings>({ ...settings.value.connection })
   const localMedia = ref<MediaSettings>({ ...settings.value.media })
   const localDisplay = ref<DisplaySettings>({ ...settings.value.display })
@@ -131,11 +154,12 @@
 
   const modelNames = computed(() => Object.keys(modelsWithFields.value).sort())
   const availableFields = computed(() => {
-    const model = localSettings.value.noteType
+    const model = localSettings.value.word.noteType
     return model ? (modelsWithFields.value[model] ?? []) : []
   })
   const settingsValid = computed(() => {
-    const { noteType, sentenceField, secondaryField, audioField, imageField } = localSettings.value
+    const { noteType, sentenceField, secondaryField, audioField, imageField } =
+      localSettings.value.word
     // Allow saving if Anki is not configured
     if (!noteType) return true
     return !!sentenceField || !!secondaryField || !!audioField || !!imageField
@@ -143,12 +167,12 @@
 
   watch(showSettings, (isOpen) => {
     if (isOpen) {
-      localSettings.value = { ...settings.value.anki }
+      localSettings.value = cloneAnki(settings.value.anki)
       localConnection.value = { ...settings.value.connection }
       localMedia.value = { ...settings.value.media }
       localDisplay.value = { ...settings.value.display }
       localPortInput.value = localConnection.value.ports.join(', ')
-      wordTagsInput.value = localSettings.value.tags.join(' ')
+      wordTagsInput.value = localSettings.value.word.tags.join(' ')
       if (connectionStatus.value === 'untested') {
         void testConnection()
       }
@@ -191,11 +215,11 @@
 
   function updateWordTags(raw: string) {
     wordTagsInput.value = raw
-    onFieldChange('tags', parseTags(raw))
+    onWordChange('tags', parseTags(raw))
   }
 
-  // Anki-field pickers, rendered via FieldSelect. Also drives the field reset
-  // on note-type change so the two can't drift.
+  // Anki-field pickers for the word card settings, rendered via FieldSelect.
+  // Also drives the field reset on note-type change so the two can't drift.
   type WordFieldKey =
     | 'frontField'
     | 'sentenceField'
@@ -226,16 +250,18 @@
   ]
 
   function onModelChange(value: string) {
-    const updated = { ...localSettings.value, noteType: value }
+    const word = { ...localSettings.value.word, noteType: value }
     for (const row of wordFieldRows) {
-      updated[row.key] = ''
+      word[row.key] = ''
     }
-    localSettings.value = updated
+    localSettings.value = { ...localSettings.value, word }
   }
 
-  function onFieldChange(field: keyof AnkiSettings, value: string | number | string[]) {
-    // @ts-ignore - dynamic assignment
-    localSettings.value = { ...localSettings.value, [field]: value }
+  function onWordChange<K extends keyof WordCardSettings>(field: K, value: WordCardSettings[K]) {
+    localSettings.value = {
+      ...localSettings.value,
+      word: { ...localSettings.value.word, [field]: value },
+    }
   }
 
   function saveSettings() {
@@ -262,7 +288,7 @@
       localMedia.value.imageAnimated = false
     }
 
-    settings.value.anki = { ...localSettings.value }
+    settings.value.anki = cloneAnki(localSettings.value)
     settings.value.connection = { ...localConnection.value }
     settings.value.media = { ...localMedia.value }
     settings.value.display = { ...localDisplay.value }
@@ -1006,7 +1032,7 @@
 
     loadingTargetCard.value = true
     try {
-      const { noteType, frontField } = settings.value.anki
+      const { noteType, frontField } = settings.value.anki.word
       const targetNote = await anki.getLastNote(noteType)
 
       if (targetNote) {
@@ -1206,7 +1232,7 @@
     const secondaryMsgs = getSelectedSecondaryMessages()
     if (!ankiConfigured.value || (primaryMsgs.length === 0 && secondaryMsgs.length === 0)) return
 
-    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki
+    const { sentenceField, secondaryField, audioField, imageField } = settings.value.anki.word
     const range = getSelectionRange() // primary first/last (audio/image come from primary)
     const first = range?.first
     const last = range?.last
@@ -1220,12 +1246,12 @@
     ankiError.value[anchorKey] = ''
 
     try {
-      const targetNote = await anki.getLastNote(settings.value.anki.noteType)
+      const targetNote = await anki.getLastNote(settings.value.anki.word.noteType)
       if (!targetNote) {
         throw new Error('No target card found in Anki')
       }
 
-      const maxAgeMinutes = settings.value.anki.maxCardAgeMinutes ?? 5
+      const maxAgeMinutes = settings.value.anki.word.maxCardAgeMinutes ?? 5
       if (maxAgeMinutes > 0) {
         const thresholdMs = maxAgeMinutes * 60000
 
@@ -1295,7 +1321,7 @@
 
       if (Object.keys(fieldUpdates).length > 0) {
         await anki.updateNoteFields(targetNote.noteId, fieldUpdates)
-        const tags = settings.value.anki.tags
+        const tags = settings.value.anki.word.tags
         if (tags.length > 0) {
           // The fields are already committed at this point, so a tagging
           // failure must not be reported as a failed send (which would invite
@@ -1890,10 +1916,14 @@
                 Connect to Anki to configure card settings.
               </div>
               <div v-else class="form-grid">
+                <p class="hint" style="grid-column: 1 / -1">
+                  Adds the selected subtitles to your most recently created Yomitan card.
+                </p>
+
                 <label class="form-group">
                   <span>Note type</span>
                   <select
-                    :value="localSettings.noteType"
+                    :value="localSettings.word.noteType"
                     @change="(e) => onModelChange((e.target as HTMLSelectElement).value)"
                   >
                     <option value="">Select a note type…</option>
@@ -1903,16 +1933,16 @@
                   </select>
                 </label>
 
-                <template v-if="localSettings.noteType">
+                <template v-if="localSettings.word.noteType">
                   <FieldSelect
                     v-for="row in wordFieldRows"
                     :key="row.key"
                     :label="row.label"
-                    :model-value="localSettings[row.key]"
+                    :model-value="localSettings.word[row.key]"
                     :options="availableFields"
                     :empty-label="row.emptyLabel"
                     :hint="row.hint"
-                    @update:model-value="(v: string) => onFieldChange(row.key, v)"
+                    @update:model-value="(v: string) => onWordChange(row.key, v)"
                   />
 
                   <label class="form-group">
@@ -1921,10 +1951,10 @@
                       type="number"
                       min="0"
                       step="0.1"
-                      :value="localSettings.maxCardAgeMinutes"
+                      :value="localSettings.word.maxCardAgeMinutes"
                       @input="
                         (e) =>
-                          onFieldChange(
+                          onWordChange(
                             'maxCardAgeMinutes',
                             parseFloat((e.target as HTMLInputElement).value) || 0,
                           )
@@ -1944,8 +1974,7 @@
                       @input="(e) => updateWordTags((e.target as HTMLInputElement).value)"
                     />
                     <small class="field-hint"
-                      >Space-separated tags added to every card created or updated (leave blank for
-                      none).</small
+                      >Space-separated tags added to word cards (leave blank for none).</small
                     >
                   </label>
                 </template>
