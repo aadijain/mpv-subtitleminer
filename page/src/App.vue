@@ -1,4 +1,5 @@
 <script setup lang="ts">
+  import FieldSelect from './components/FieldSelect.vue'
   import MediaConfiguration from './components/MediaConfiguration.vue'
   import {
     computed,
@@ -193,16 +194,43 @@
     onFieldChange('tags', parseTags(raw))
   }
 
+  // Anki-field pickers, rendered via FieldSelect. Also drives the field reset
+  // on note-type change so the two can't drift.
+  type WordFieldKey =
+    | 'frontField'
+    | 'sentenceField'
+    | 'secondaryField'
+    | 'audioField'
+    | 'imageField'
+  const wordFieldRows: { key: WordFieldKey; label: string; emptyLabel: string; hint?: string }[] = [
+    {
+      key: 'frontField',
+      label: 'Front field',
+      emptyLabel: 'Select…',
+      hint: 'Used to find the target card',
+    },
+    {
+      key: 'sentenceField',
+      label: 'Sentence field',
+      emptyLabel: "Don't update",
+      hint: 'Filled from the primary column selection',
+    },
+    {
+      key: 'secondaryField',
+      label: 'Secondary sentence field',
+      emptyLabel: "Don't update",
+      hint: 'Filled from the secondary column selection',
+    },
+    { key: 'audioField', label: 'Audio field', emptyLabel: "Don't update" },
+    { key: 'imageField', label: 'Image field', emptyLabel: "Don't update" },
+  ]
+
   function onModelChange(value: string) {
-    localSettings.value = {
-      ...localSettings.value,
-      noteType: value,
-      frontField: '',
-      sentenceField: '',
-      secondaryField: '',
-      audioField: '',
-      imageField: '',
+    const updated = { ...localSettings.value, noteType: value }
+    for (const row of wordFieldRows) {
+      updated[row.key] = ''
     }
+    localSettings.value = updated
   }
 
   function onFieldChange(field: keyof AnkiSettings, value: string | number | string[]) {
@@ -1876,84 +1904,16 @@
                 </label>
 
                 <template v-if="localSettings.noteType">
-                  <label class="form-group">
-                    <span>Front field</span>
-                    <select
-                      :value="localSettings.frontField"
-                      @change="
-                        (e) => onFieldChange('frontField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Select…</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Used to find the target card</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Sentence field</span>
-                    <select
-                      :value="localSettings.sentenceField"
-                      @change="
-                        (e) => onFieldChange('sentenceField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Filled from the primary column selection</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Secondary sentence field</span>
-                    <select
-                      :value="localSettings.secondaryField"
-                      @change="
-                        (e) =>
-                          onFieldChange('secondaryField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                    <small class="field-hint">Filled from the secondary column selection</small>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Audio field</span>
-                    <select
-                      :value="localSettings.audioField"
-                      @change="
-                        (e) => onFieldChange('audioField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                  </label>
-
-                  <label class="form-group">
-                    <span>Image field</span>
-                    <select
-                      :value="localSettings.imageField"
-                      @change="
-                        (e) => onFieldChange('imageField', (e.target as HTMLSelectElement).value)
-                      "
-                    >
-                      <option value="">Don't update</option>
-                      <option v-for="field in availableFields" :key="field" :value="field">
-                        {{ field }}
-                      </option>
-                    </select>
-                  </label>
+                  <FieldSelect
+                    v-for="row in wordFieldRows"
+                    :key="row.key"
+                    :label="row.label"
+                    :model-value="localSettings[row.key]"
+                    :options="availableFields"
+                    :empty-label="row.emptyLabel"
+                    :hint="row.hint"
+                    @update:model-value="(v: string) => onFieldChange(row.key, v)"
+                  />
 
                   <label class="form-group">
                     <span>Max card age (minutes)</span>
